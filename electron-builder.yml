@@ -1,0 +1,32 @@
+appId: com.interviewcopilot.app
+productName: Interview Copilot
+directories:
+  buildResources: build
+files:
+  - out/**
+  - package.json
+  - '!**/.vscode/*'
+  - '!src/*'
+  - '!electron.vite.config.{js,ts,mjs,cjs}'
+  - '!{.env,.env.*,.npmrc,pnpm-lock.yaml,package-lock.json}'
+  - '!{tsconfig.json,tsconfig.node.json,tsconfig.web.json}'
+  - '!{postcss.config.js,tailwind.config.js}'
+  - '!{.eslintrc.cjs,.eslintignore,.prettierignore,.prettierrc,README.md,CHANGELOG.md}'
+# Unpack the PDF/Office parsers so their pdfjs worker + assets load from disk (not from inside the asar).
+asarUnpack:
+  - node_modules/pdf-parse/**
+  - node_modules/pdfjs-dist/**
+win:
+  executableName: interview-copilot
+  target:
+    - nsis
+nsis:
+  artifactName: ${name}-${version}-setup.${ext}
+  shortcutName: ${productName}
+  uninstallDisplayName: ${productName}
+  createDesktopShortcut: always
+  oneClick: false
+  perMachine: false
+  allowToChangeInstallationDirectory: true
+# No publish provider — local build only.
+publish: null
