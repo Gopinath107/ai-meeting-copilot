@@ -29,6 +29,9 @@ let stealthOn = true
 let aiAbort: AbortController | null = null
 const audioSamples = { system: 0, mic: 0 }
 let audioStatsTimer: ReturnType<typeof setInterval> | null = null
+// Meeting mode requests diarization-capable ASR (Deepgram) so several speakers
+// can be told apart; set per session when audio capture starts.
+let preferDiarization = false
 const asrStreams: { system: AsrStream | null; mic: AsrStream | null } = {
   system: null,
   mic: null
@@ -221,7 +224,13 @@ function startSarvam(
 
 function startAsr(kind: 'system' | 'mic', source: 'interviewer' | 'you'): void {
   const s = getSettings()
-  if (s.sarvamApiKey) {
+  // Meeting mode prefers Deepgram because it supports diarization (Speaker 1..N),
+  // which is needed to tell several participants apart. Sarvam streaming has no
+  // diarization, so it is only used when Deepgram isn't available (or in
+  // interview mode, where a single interviewer needs no speaker separation).
+  if (preferDiarization && s.deepgramApiKey) {
+    startDeepgram(kind, source, s.deepgramApiKey)
+  } else if (s.sarvamApiKey) {
     startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey)
   } else if (s.deepgramApiKey) {
     startDeepgram(kind, source, s.deepgramApiKey)
@@ -290,7 +299,8 @@ function setupAudio(): void {
       asrStreams[kind]?.send(buffer)
     }
   })
-  ipcMain.on('audio:start', (_event, mic: boolean) => {
+  ipcMain.on('audio:start', (_event, mic: boolean, diarize?: boolean) => {
+    preferDiarization = Boolean(diarize)
     audioSamples.system = 0
     audioSamples.mic = 0
     if (audioStatsTimer) clearInterval(audioStatsTimer)

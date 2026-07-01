@@ -1,5 +1,5 @@
 import { useState } from 'react'
-import type { SessionConfig } from '../App'
+import type { SessionConfig, SessionMode } from '../App'
 import SettingsPanel from './SettingsPanel'
 
 function FileRow({
@@ -33,6 +33,7 @@ function FileRow({
 }
 
 export default function SetupView({ onStart }: { onStart: (config: SessionConfig) => void }) {
+  const [mode, setMode] = useState<SessionMode>('interview')
   const [role, setRole] = useState('')
   const [meetingUrl, setMeetingUrl] = useState('')
   const [resumeName, setResumeName] = useState<string>()
@@ -42,6 +43,10 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
   const [docsText, setDocsText] = useState('')
   const [busy, setBusy] = useState<'resume' | 'extra' | null>(null)
   const [showSettings, setShowSettings] = useState(false)
+  // Meeting-mode context
+  const [userName, setUserName] = useState('')
+  const [projectContext, setProjectContext] = useState('')
+  const [techStack, setTechStack] = useState('')
 
   async function pick(kind: 'resume' | 'extra'): Promise<void> {
     setBusy(kind)
@@ -67,7 +72,9 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
       <div className="drag flex items-center justify-between px-4 py-3">
         <div className="flex items-center gap-2">
           <div className="h-2.5 w-2.5 rounded-full bg-indigo-400" />
-          <span className="text-sm font-semibold text-zinc-100">Interview Copilot</span>
+          <span className="text-sm font-semibold text-zinc-100">
+            {mode === 'meeting' ? 'Meeting Copilot' : 'Interview Copilot'}
+          </span>
         </div>
         <div className="no-drag flex items-center gap-2">
           <button
@@ -93,15 +100,76 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
 
       {/* Body */}
       <div className="no-drag flex-1 space-y-4 overflow-y-auto px-4 pb-4">
+        {/* Mode selector */}
+        <div className="grid grid-cols-2 gap-2 rounded-lg border border-white/10 bg-white/5 p-1">
+          {(['interview', 'meeting'] as const).map((m) => (
+            <button
+              key={m}
+              onClick={() => setMode(m)}
+              className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
+                mode === m
+                  ? 'bg-indigo-500 text-white'
+                  : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'
+              }`}
+            >
+              {m === 'interview' ? 'Interview' : 'Meeting'}
+            </button>
+          ))}
+        </div>
+        <p className="text-[11px] text-zinc-500">
+          {mode === 'meeting'
+            ? 'Analyzes the team discussion live — flags issues, suggests fixes and follow-ups, and answers questions aimed at you.'
+            : 'Streams first-person answer suggestions when the interviewer asks a question.'}
+        </p>
+
         <div>
-          <label className="mb-1 block text-xs font-medium text-zinc-400">Role / position</label>
+          <label className="mb-1 block text-xs font-medium text-zinc-400">
+            {mode === 'meeting' ? 'Your role' : 'Role / position'}
+          </label>
           <input
             value={role}
             onChange={(e) => setRole(e.target.value)}
-            placeholder="e.g. Senior Backend Engineer"
+            placeholder={
+              mode === 'meeting' ? 'e.g. Backend Lead' : 'e.g. Senior Backend Engineer'
+            }
             className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
           />
         </div>
+
+        {mode === 'meeting' && (
+          <>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-400">Your name</label>
+              <input
+                value={userName}
+                onChange={(e) => setUserName(e.target.value)}
+                placeholder="Used to detect when a question is aimed at you"
+                className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-400">
+                Project / application
+              </label>
+              <textarea
+                value={projectContext}
+                onChange={(e) => setProjectContext(e.target.value)}
+                placeholder="What is the app, and what feature(s) are you discussing? e.g. B2B invoicing app — reviewing the login / auth flow…"
+                rows={4}
+                className="w-full resize-none rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
+              />
+            </div>
+            <div>
+              <label className="mb-1 block text-xs font-medium text-zinc-400">Tech stack</label>
+              <input
+                value={techStack}
+                onChange={(e) => setTechStack(e.target.value)}
+                placeholder="e.g. React, Node.js, PostgreSQL, AWS"
+                className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
+              />
+            </div>
+          </>
+        )}
 
         <div>
           <label className="mb-1 block text-xs font-medium text-zinc-400">Meeting link (yours)</label>
@@ -116,33 +184,41 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
           </p>
         </div>
 
-        <div>
-          <label className="mb-1 block text-xs font-medium text-zinc-400">Job description</label>
-          <textarea
-            value={jobDescription}
-            onChange={(e) => setJobDescription(e.target.value)}
-            placeholder="Paste the job description here…"
-            rows={5}
-            className="w-full resize-none rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
-          />
-        </div>
+        {mode === 'interview' && (
+          <div>
+            <label className="mb-1 block text-xs font-medium text-zinc-400">Job description</label>
+            <textarea
+              value={jobDescription}
+              onChange={(e) => setJobDescription(e.target.value)}
+              placeholder="Paste the job description here…"
+              rows={5}
+              className="w-full resize-none rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
+            />
+          </div>
+        )}
 
         <div className="space-y-2">
           <label className="block text-xs font-medium text-zinc-400">Documents</label>
+          {mode === 'interview' && (
+            <FileRow
+              label="Résumé"
+              hint="PDF, DOCX or TXT"
+              value={
+                resumeName
+                  ? `${resumeName}${resumeText ? ` · ${resumeText.length.toLocaleString()} chars parsed` : ' · could not read text'}`
+                  : undefined
+              }
+              busy={busy === 'resume'}
+              onChoose={() => pick('resume')}
+            />
+          )}
           <FileRow
-            label="Résumé"
-            hint="PDF, DOCX or TXT"
-            value={
-              resumeName
-                ? `${resumeName}${resumeText ? ` · ${resumeText.length.toLocaleString()} chars parsed` : ' · could not read text'}`
-                : undefined
+            label={mode === 'meeting' ? 'Reference docs' : 'Extra docs'}
+            hint={
+              mode === 'meeting'
+                ? 'Specs, tickets, design docs (optional)'
+                : 'Notes, portfolio, projects (optional)'
             }
-            busy={busy === 'resume'}
-            onChoose={() => pick('resume')}
-          />
-          <FileRow
-            label="Extra docs"
-            hint="Notes, portfolio, projects (optional)"
             value={
               docNames.length
                 ? `${docNames.length} file(s)${docsText ? ` · ${docsText.length.toLocaleString()} chars` : ''}`
@@ -158,11 +234,23 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
       <div className="no-drag border-t border-white/10 px-4 py-3">
         <button
           onClick={() =>
-            onStart({ role, meetingUrl, resumeName, resumeText, jobDescription, docNames, docsText })
+            onStart({
+              mode,
+              role,
+              meetingUrl,
+              resumeName,
+              resumeText,
+              jobDescription,
+              docNames,
+              docsText,
+              userName,
+              projectContext,
+              techStack
+            })
           }
           className="w-full rounded-lg bg-indigo-500 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-400"
         >
-          Start session
+          {mode === 'meeting' ? 'Start meeting' : 'Start session'}
         </button>
       </div>
 

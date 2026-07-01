@@ -2,7 +2,10 @@ import { useEffect, useState } from 'react'
 import SetupView from './views/SetupView'
 import OverlayView from './views/OverlayView'
 
+export type SessionMode = 'interview' | 'meeting'
+
 export type SessionConfig = {
+  mode: SessionMode
   role: string
   meetingUrl: string
   resumeName?: string
@@ -10,6 +13,10 @@ export type SessionConfig = {
   jobDescription?: string
   docNames: string[]
   docsText?: string
+  // Meeting-mode context: helps the AI ground its analysis and answers.
+  userName?: string
+  projectContext?: string
+  techStack?: string
 }
 
 export default function App() {

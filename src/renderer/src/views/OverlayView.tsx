@@ -1,5 +1,5 @@
-import { useEffect, useRef, useState } from 'react'
-import type { SessionConfig } from '../App'
+import { useEffect, useMemo, useRef, useState } from 'react'
+import type { SessionConfig, SessionMode } from '../App'
 import { AudioCapture, type AudioSourceKind } from '../audio/AudioCapture'
 import { Markdown } from '../components/Markdown'
 
@@ -139,25 +139,56 @@ function looksLikeQuestion(raw: string): boolean {
   return false
 }
 
+/**
+ * In a group meeting, decide whether an utterance is aimed at ME specifically
+ * (so the AI should draft an answer for me to say) rather than being general
+ * team discussion (which the AI just analyses). We trigger on my name or on
+ * clear second-person question cues.
+ */
+function isDirectedAtMe(raw: string, userName?: string): boolean {
+  const t = raw.trim().toLowerCase()
+  if (t.length < 3) return false
+  const name = userName?.trim().toLowerCase()
+  if (name) {
+    const first = name.split(/\s+/)[0]
+    if (first && first.length >= 2) {
+      const re = new RegExp(`\\b${first.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`)
+      if (re.test(t)) return true
+    }
+  }
+  // Second-person cues that indicate the speaker is asking the listener (me).
+  const youCues =
+    /\b(what do you think|your thoughts|your take|can you|could you|would you|how would you|what would you|do you (know|think|have)|any (thoughts|ideas|input)|over to you|what about you|your opinion)\b/
+  if (youCues.test(t) && looksLikeQuestion(raw)) return true
+  return false
+}
+
 function TranscriptLine({
   source,
   text,
   interim,
-  speaker
+  speaker,
+  meeting,
+  name
 }: {
   source: TranscriptSource
   text: string
   interim: boolean
   speaker?: number
+  meeting?: boolean
+  name?: string
 }) {
   const isInterviewer = source === 'interviewer'
   const color = isInterviewer
     ? INTERVIEWER_COLORS[(speaker ?? 0) % INTERVIEWER_COLORS.length]
     : 'text-sky-300'
+  const speakerWord = meeting ? 'Speaker' : 'Interviewer'
   const label = isInterviewer
-    ? speaker != null
-      ? `Interviewer ${speaker + 1}`
-      : 'Interviewer'
+    ? name?.trim()
+      ? name.trim()
+      : speaker != null
+        ? `${speakerWord} ${speaker + 1}`
+        : speakerWord
     : 'You'
   return (
     <div className={interim ? 'opacity-60' : ''}>
@@ -233,6 +264,32 @@ export default function OverlayView({
   const [seconds, setSeconds] = useState<{ system: number; mic: number }>({ system: 0, mic: 0 })
   const [audioError, setAudioError] = useState<string | null>(null)
 
+  // ----- Meeting mode -----
+  const mode: SessionMode = config?.mode ?? 'interview'
+  const isMeeting = mode === 'meeting'
+  const [analysis, setAnalysis] = useState('')
+  const [autoAnalyze, setAutoAnalyze] = useState(isMeeting)
+  const [activeTab, setActiveTab] = useState<'analysis' | 'answer'>(
+    isMeeting ? 'analysis' : 'answer'
+  )
+  // Which kind of AI request is currently streaming, so tokens land in the right
+  // pane (the main process only runs one stream at a time).
+  const intentRef = useRef<'answer' | 'analyze'>('answer')
+  const analysisAccRef = useRef('')
+  const autoAnalyzeRef = useRef(autoAnalyze)
+  const lastAnalyzedCountRef = useRef(0)
+  useEffect(() => {
+    autoAnalyzeRef.current = autoAnalyze
+  }, [autoAnalyze])
+
+  // Map each diarized speaker index to a real name the user types in. Used in
+  // the transcript UI and in the transcript text handed to the AI.
+  const [speakerNames, setSpeakerNames] = useState<Record<number, string>>({})
+  const speakerNamesRef = useRef(speakerNames)
+  useEffect(() => {
+    speakerNamesRef.current = speakerNames
+  }, [speakerNames])
+
   const finalsRef = useRef(finals)
   const autoAnswerRef = useRef(autoAnswer)
   const streamingRef = useRef(streaming)
@@ -260,6 +317,7 @@ export default function OverlayView({
   // gives a single answer per question instead of one per fragment.
   const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const turnHasQuestionRef = useRef(false)
+  const turnDirectedRef = useRef(false)
 
   // Conversation memory: prior (question -> answer) turns so the model can
   // resolve follow-ups like "explain that code", "add error handling", or
@@ -270,6 +328,7 @@ export default function OverlayView({
   const answerAccRef = useRef('')
 
   function buildSystemPrompt(): string {
+    if (isMeeting) return buildMeetingSystemPrompt()
     const role = config?.role?.trim()
     const jd = config?.jobDescription?.trim()
     const resume = config?.resumeText?.trim()
@@ -300,14 +359,49 @@ export default function OverlayView({
       .join('\n')
   }
 
+  function buildMeetingSystemPrompt(): string {
+    const role = config?.role?.trim()
+    const project = config?.projectContext?.trim()
+    const stack = config?.techStack?.trim()
+    const docs = config?.docsText?.trim()
+    const name = config?.userName?.trim()
+    return [
+      'You are a principal software engineer and solution architect with 20-30 years of hands-on experience, silently assisting me during a live team meeting.',
+      'Several participants (labelled Speaker 1, Speaker 2, ... in the transcript) are discussing an application and its features (for example a login page, an API, a data model).',
+      'Two request types will come to you — obey the one named in the user message:',
+      '',
+      '[ANALYZE] Evaluate the ongoing discussion at a senior/architect level. Respond ONLY with this compact Markdown structure, omitting any section that has nothing substantive to add:',
+      '**Topic:** the specific feature/area under discussion (one line).',
+      '**Assessment:** is what they are saying technically correct and sound? Explicitly confirm what is right and flag what is wrong, risky, or imprecise.',
+      '**Corrections:** the correct approach for anything that was wrong — precise and actionable.',
+      '**Suggestions:** best practices, trade-offs, edge cases, security/scalability/maintainability concerns they are missing.',
+      '**Follow-ups:** 2-3 sharp questions that move the discussion forward or expose gaps.',
+      'Keep it tight and skimmable — short bullets, **bold** key terms, correct terminology. No filler, no restating the transcript.',
+      '',
+      '[ANSWER] A question has been directed at me. Answer in the FIRST PERSON as me, in a clear, confident, senior voice, ready to say out loud. Lead with the direct answer, then 2-4 crisp supporting points. Use short "-" bullets for multi-part answers and fenced code blocks (with a language tag) for any code, commands, JSON, or SQL. Be precise and pragmatic, mention the key trade-off, and stay concise.',
+      '',
+      'Rules for both: Never fabricate facts, numbers, names, APIs, or library behaviour — use only real, standard, documented technology, and if unsure say so or use a well-known correct alternative. Prefer precision over sounding impressive. Ground everything in the project context below.',
+      name ? `My name: ${name}.` : '',
+      role ? `My role: ${role}.` : '',
+      project ? `Project / application context:\n${project}` : '',
+      stack ? `Tech stack: ${stack}.` : '',
+      docs ? `Reference docs:\n${docs}` : ''
+    ]
+      .filter(Boolean)
+      .join('\n')
+  }
+
   function recentTranscript(n: number): string {
     return finalsRef.current
       .slice(-n)
-      .map((l) =>
-        l.source === 'interviewer'
-          ? `Interviewer${l.speaker != null ? ' ' + (l.speaker + 1) : ''}: ${l.text}`
-          : `Me: ${l.text}`
-      )
+      .map((l) => {
+        if (l.source !== 'interviewer') return `Me: ${l.text}`
+        const named = l.speaker != null ? speakerNamesRef.current[l.speaker]?.trim() : ''
+        const who = named
+          ? named
+          : `${isMeeting ? 'Speaker' : 'Interviewer'}${l.speaker != null ? ' ' + (l.speaker + 1) : ''}`
+        return `${who}: ${l.text}`
+      })
       .join('\n')
   }
 
@@ -332,6 +426,8 @@ export default function OverlayView({
   function streamAnswer(user: string): void {
     // Supersede any in-flight request so a new question is never blocked.
     if (streamingRef.current) window.api.aiCancel()
+    intentRef.current = 'answer'
+    setActiveTab('answer')
     setSuggestion('')
     setAiError(null)
     setStreaming(true)
@@ -346,8 +442,44 @@ export default function OverlayView({
     ])
   }
 
+  /**
+   * Meeting mode: analyse the recent discussion (validate correctness, suggest
+   * fixes, propose follow-up questions). Routed to the Analysis pane. Analysis
+   * is stateless — it is not added to the answer conversation memory.
+   */
+  function streamAnalysis(user: string): void {
+    if (streamingRef.current) window.api.aiCancel()
+    intentRef.current = 'analyze'
+    setActiveTab('analysis')
+    setAnalysis('')
+    setAiError(null)
+    setStreaming(true)
+    streamingRef.current = true
+    analysisAccRef.current = ''
+    pendingUserRef.current = null
+    lastAnalyzedCountRef.current = finalsRef.current.length
+    armWatchdog()
+    window.api.aiAsk([
+      { role: 'system', content: buildSystemPrompt() },
+      { role: 'user', content: user }
+    ])
+  }
+
+  function analyzeDiscussion(): void {
+    if (finalsRef.current.length === 0) return
+    streamAnalysis(
+      `[ANALYZE] Here is the recent meeting discussion:\n${recentTranscript(16)}\n\nAnalyse it now using the ANALYZE format.`
+    )
+  }
+
   function askAi(): void {
     if (finalsRef.current.length === 0) return
+    if (isMeeting) {
+      streamAnswer(
+        `[ANSWER] Recent meeting discussion:\n${recentTranscript(14)}\n\nA question has been directed at me. Answer the most recent question aimed at me, in the first person, ready to say out loud.`
+      )
+      return
+    }
     streamAnswer(
       `Interview transcript so far:\n${recentTranscript(14)}\n\nAnswer the interviewer's most recent question thoroughly. If they asked several questions, address each one.`
     )
@@ -357,9 +489,11 @@ export default function OverlayView({
     const q = manualQuestion.trim()
     if (!q) return
     const ctx = recentTranscript(8)
-    const user =
-      (ctx ? `Recent conversation (context):\n${ctx}\n\n` : '') +
-      `The interviewer asked:\n"${q}"\n\nGive me the best answer to say out loud.`
+    const user = isMeeting
+      ? (ctx ? `[ANSWER] Recent meeting discussion (context):\n${ctx}\n\n` : '[ANSWER] ') +
+        `Answer this for me, in the first person, ready to say out loud:\n"${q}"`
+      : (ctx ? `Recent conversation (context):\n${ctx}\n\n` : '') +
+        `The interviewer asked:\n"${q}"\n\nGive me the best answer to say out loud.`
     streamAnswer(user)
     setManualQuestion('')
   }
@@ -380,24 +514,30 @@ export default function OverlayView({
   useEffect(() => {
     const offToken = window.api.onAiToken((t) => {
       armWatchdog()
-      answerAccRef.current += t
-      setSuggestion((prev) => prev + t)
+      if (intentRef.current === 'analyze') {
+        analysisAccRef.current += t
+        setAnalysis((prev) => prev + t)
+      } else {
+        answerAccRef.current += t
+        setSuggestion((prev) => prev + t)
+      }
     })
     const offDone = window.api.onAiDone(() => {
       clearWatchdog()
       setStreaming(false)
       streamingRef.current = false
-      // Remember this turn so the next question can build on it. Cap each side
-      // and keep only the last few turns to stay cheap and within context.
-      const user = pendingUserRef.current
-      const answer = answerAccRef.current.trim()
-      if (user && answer) {
-        historyRef.current.push(
-          { role: 'user', content: user.slice(-700) },
-          { role: 'assistant', content: answer.slice(-2000) }
-        )
-        if (historyRef.current.length > 8) {
-          historyRef.current = historyRef.current.slice(-8)
+      // Only answers become conversation memory; analysis is stateless.
+      if (intentRef.current === 'answer') {
+        const user = pendingUserRef.current
+        const answer = answerAccRef.current.trim()
+        if (user && answer) {
+          historyRef.current.push(
+            { role: 'user', content: user.slice(-700) },
+            { role: 'assistant', content: answer.slice(-2000) }
+          )
+          if (historyRef.current.length > 8) {
+            historyRef.current = historyRef.current.slice(-8)
+          }
         }
       }
       pendingUserRef.current = null
@@ -424,9 +564,32 @@ export default function OverlayView({
   }, [])
 
   useEffect(() => {
-    if (!autoAnswerRef.current) return
     const last = finals[finals.length - 1]
     if (!last || last.source !== 'interviewer') return
+
+    if (isMeeting) {
+      // Meeting mode runs off two independent toggles, so don't early-return on
+      // autoAnswer. Track whether this turn was aimed at me, then on silence
+      // either draft an answer (aimed at me) or analyse the discussion.
+      if (isDirectedAtMe(last.text, config?.userName)) turnDirectedRef.current = true
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
+      autoTimerRef.current = setTimeout(() => {
+        autoTimerRef.current = null
+        const directed = turnDirectedRef.current
+        turnDirectedRef.current = false
+        if (streamingRef.current) return
+        if (directed && autoAnswerRef.current) {
+          askAi()
+        } else if (autoAnalyzeRef.current) {
+          // Only analyse once there is enough fresh discussion to be worth it.
+          if (finalsRef.current.length - lastAnalyzedCountRef.current >= 2) analyzeDiscussion()
+        }
+      }, 1600)
+      // eslint-disable-next-line react-hooks/exhaustive-deps
+      return
+    }
+
+    if (!autoAnswerRef.current) return
     // The interviewer is still in their turn. Remember if any fragment so far is
     // a question, then (re)arm the "they've stopped talking" timer. A short pause
     // inside a sentence must NOT end the turn, so the window is safely longer
@@ -513,6 +676,8 @@ export default function OverlayView({
     setFinals([])
     setInterim({ interviewer: '', you: '' })
     setDgStatus('')
+    setSpeakerNames({})
+    lastAnalyzedCountRef.current = 0
     vadRef.current = {
       system: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 },
       mic: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 }
@@ -526,7 +691,7 @@ export default function OverlayView({
       onError: (kind, err) => setAudioError(`${kind}: ${err.message}`)
     })
     captureRef.current = capture
-    window.api.audioStart(micEnabled)
+    window.api.audioStart(micEnabled, isMeeting)
     setCapturing(true)
     try {
       await capture.startSystem()
@@ -557,6 +722,14 @@ export default function OverlayView({
     return off
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
+
+  // Speaker indices seen so far (interviewer/meeting audio only), so the UI can
+  // offer a name box per participant as they start talking.
+  const seenSpeakers = useMemo(() => {
+    const set = new Set<number>()
+    for (const f of finals) if (f.source === 'interviewer' && f.speaker != null) set.add(f.speaker)
+    return [...set].sort((a, b) => a - b)
+  }, [finals])
 
   return (
     <div className="flex h-full flex-col">
@@ -631,7 +804,7 @@ export default function OverlayView({
         </div>
         <div className="flex items-center gap-3">
           <Meter
-            label="Interviewer (system)"
+            label={isMeeting ? 'Meeting (system)' : 'Interviewer (system)'}
             level={levels.system}
             seconds={seconds.system}
             active={capturing}
@@ -641,6 +814,27 @@ export default function OverlayView({
           )}
         </div>
       </div>
+
+      {/* Speaker name mapping (meeting mode) */}
+      {isMeeting && seenSpeakers.length > 0 && (
+        <div className="no-drag mx-3 mb-2 flex flex-wrap items-center gap-1.5 rounded-xl border border-white/10 bg-black/20 p-2">
+          <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
+            Names
+          </span>
+          {seenSpeakers.map((sp) => (
+            <input
+              key={sp}
+              value={speakerNames[sp] ?? ''}
+              onChange={(e) =>
+                setSpeakerNames((prev) => ({ ...prev, [sp]: e.target.value }))
+              }
+              placeholder={`Speaker ${sp + 1}`}
+              title={`Name for Speaker ${sp + 1}`}
+              className={`w-24 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none ${INTERVIEWER_COLORS[sp % INTERVIEWER_COLORS.length]}`}
+            />
+          ))}
+        </div>
+      )}
 
       {/* Transcript pane */}
       <div className="no-drag mx-3 mb-2 flex-1 overflow-hidden rounded-xl border border-white/10 bg-black/30">
@@ -677,12 +871,21 @@ export default function OverlayView({
                   text={line.text}
                   speaker={line.speaker}
                   interim={false}
+                  meeting={isMeeting}
+                  name={line.speaker != null ? speakerNames[line.speaker] : undefined}
                 />
               ))}
               {interim.interviewer && (
-                <TranscriptLine source="interviewer" text={interim.interviewer} interim />
+                <TranscriptLine
+                  source="interviewer"
+                  text={interim.interviewer}
+                  interim
+                  meeting={isMeeting}
+                />
               )}
-              {interim.you && <TranscriptLine source="you" text={interim.you} interim />}
+              {interim.you && (
+                <TranscriptLine source="you" text={interim.you} interim meeting={isMeeting} />
+              )}
             </>
           )}
         </div>
@@ -699,7 +902,11 @@ export default function OverlayView({
               askManual()
             }
           }}
-          placeholder="Type a question (scenario / long) and press Enter…"
+          placeholder={
+            isMeeting
+              ? 'Ask for an answer or type a question to address…'
+              : 'Type a question (scenario / long) and press Enter…'
+          }
           className="flex-1 rounded-md border border-white/10 bg-black/30 px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/40 focus:outline-none"
         />
         <button
@@ -712,56 +919,162 @@ export default function OverlayView({
       </div>
 
       {/* Suggestion pane */}
-      <div className="no-drag mx-3 mb-3 flex h-[42%] flex-col overflow-hidden rounded-xl border border-indigo-400/20 bg-indigo-500/10">
-        <div className="flex items-center justify-between border-b border-white/10 px-3 py-1.5">
-          <span className="text-[11px] font-medium uppercase tracking-wide text-indigo-300">
-            AI answer
-          </span>
-          <div className="flex items-center gap-1.5">
-            <button
-              onClick={() => setAutoAnswer((v) => !v)}
-              title="Auto-answer when the interviewer asks a question"
-              className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                autoAnswer ? 'bg-indigo-400/25 text-indigo-200' : 'bg-white/5 text-zinc-500'
-              }`}
-            >
-              Auto {autoAnswer ? 'on' : 'off'}
-            </button>
-            {streaming ? (
+      {isMeeting ? (
+        <div className="no-drag mx-3 mb-3 flex h-[42%] flex-col overflow-hidden rounded-xl border border-indigo-400/20 bg-indigo-500/10">
+          <div className="flex items-center justify-between border-b border-white/10 px-3 py-1.5">
+            <div className="flex items-center gap-1">
               <button
-                onClick={cancelAi}
-                className="rounded bg-red-500/80 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-500"
+                onClick={() => setActiveTab('analysis')}
+                className={`rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${
+                  activeTab === 'analysis'
+                    ? 'bg-indigo-400/25 text-indigo-100'
+                    : 'text-zinc-500 hover:text-zinc-300'
+                }`}
               >
-                Stop
+                Analysis
               </button>
-            ) : (
               <button
-                onClick={askAi}
-                className="rounded bg-indigo-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-indigo-400"
+                onClick={() => setActiveTab('answer')}
+                className={`rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${
+                  activeTab === 'answer'
+                    ? 'bg-indigo-400/25 text-indigo-100'
+                    : 'text-zinc-500 hover:text-zinc-300'
+                }`}
               >
                 Answer
               </button>
+            </div>
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setAutoAnalyze((v) => !v)}
+                title="Continuously analyse the team discussion"
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                  autoAnalyze ? 'bg-emerald-400/20 text-emerald-200' : 'bg-white/5 text-zinc-500'
+                }`}
+              >
+                Auto-analyse {autoAnalyze ? 'on' : 'off'}
+              </button>
+              <button
+                onClick={() => setAutoAnswer((v) => !v)}
+                title="Auto-answer when a question is aimed at you"
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                  autoAnswer ? 'bg-indigo-400/25 text-indigo-200' : 'bg-white/5 text-zinc-500'
+                }`}
+              >
+                Auto-answer {autoAnswer ? 'on' : 'off'}
+              </button>
+              {streaming ? (
+                <button
+                  onClick={cancelAi}
+                  className="rounded bg-red-500/80 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-500"
+                >
+                  Stop
+                </button>
+              ) : activeTab === 'analysis' ? (
+                <button
+                  onClick={analyzeDiscussion}
+                  className="rounded bg-emerald-500/90 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-emerald-400"
+                >
+                  Analyse
+                </button>
+              ) : (
+                <button
+                  onClick={askAi}
+                  className="rounded bg-indigo-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-indigo-400"
+                >
+                  Answer
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto px-3 py-2 text-sm leading-relaxed text-zinc-100">
+            {aiError ? (
+              <span className="text-red-300">{aiError}</span>
+            ) : activeTab === 'analysis' ? (
+              analysis ? (
+                <div>
+                  <Markdown>{analysis}</Markdown>
+                  {streaming && intentRef.current === 'analyze' && (
+                    <span className="ml-0.5 animate-pulse text-emerald-300">▍</span>
+                  )}
+                </div>
+              ) : streaming && intentRef.current === 'analyze' ? (
+                <span className="text-zinc-500">Analysing the discussion…</span>
+              ) : (
+                <span className="text-zinc-500">
+                  Live analysis of the discussion appears here — what’s correct, what to fix, and
+                  smart follow-up questions.
+                </span>
+              )
+            ) : suggestion ? (
+              <div>
+                <Markdown>{suggestion}</Markdown>
+                {streaming && intentRef.current === 'answer' && (
+                  <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>
+                )}
+              </div>
+            ) : streaming && intentRef.current === 'answer' ? (
+              <span className="text-zinc-500">Generating…</span>
+            ) : (
+              <span className="text-zinc-500">
+                Answers to questions aimed at you appear here. Press{' '}
+                <kbd className="rounded bg-white/10 px-1">Ctrl+Shift+Enter</kbd> / Answer.
+              </span>
             )}
           </div>
         </div>
-        <div className="flex-1 overflow-y-auto px-3 py-2 text-sm leading-relaxed text-zinc-100">
-          {aiError ? (
-            <span className="text-red-300">{aiError}</span>
-          ) : suggestion ? (
-            <div>
-              <Markdown>{suggestion}</Markdown>
-              {streaming && <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>}
-            </div>
-          ) : streaming ? (
-            <span className="text-zinc-500">Generating…</span>
-          ) : (
-            <span className="text-zinc-500">
-              Auto-answers when a question is detected, or press{' '}
-              <kbd className="rounded bg-white/10 px-1">Ctrl+Shift+Enter</kbd> / Answer.
+      ) : (
+        <div className="no-drag mx-3 mb-3 flex h-[42%] flex-col overflow-hidden rounded-xl border border-indigo-400/20 bg-indigo-500/10">
+          <div className="flex items-center justify-between border-b border-white/10 px-3 py-1.5">
+            <span className="text-[11px] font-medium uppercase tracking-wide text-indigo-300">
+              AI answer
             </span>
-          )}
+            <div className="flex items-center gap-1.5">
+              <button
+                onClick={() => setAutoAnswer((v) => !v)}
+                title="Auto-answer when the interviewer asks a question"
+                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
+                  autoAnswer ? 'bg-indigo-400/25 text-indigo-200' : 'bg-white/5 text-zinc-500'
+                }`}
+              >
+                Auto {autoAnswer ? 'on' : 'off'}
+              </button>
+              {streaming ? (
+                <button
+                  onClick={cancelAi}
+                  className="rounded bg-red-500/80 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-500"
+                >
+                  Stop
+                </button>
+              ) : (
+                <button
+                  onClick={askAi}
+                  className="rounded bg-indigo-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-indigo-400"
+                >
+                  Answer
+                </button>
+              )}
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto px-3 py-2 text-sm leading-relaxed text-zinc-100">
+            {aiError ? (
+              <span className="text-red-300">{aiError}</span>
+            ) : suggestion ? (
+              <div>
+                <Markdown>{suggestion}</Markdown>
+                {streaming && <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>}
+              </div>
+            ) : streaming ? (
+              <span className="text-zinc-500">Generating…</span>
+            ) : (
+              <span className="text-zinc-500">
+                Auto-answers when a question is detected, or press{' '}
+                <kbd className="rounded bg-white/10 px-1">Ctrl+Shift+Enter</kbd> / Answer.
+              </span>
+            )}
+          </div>
         </div>
-      </div>
+      )}
 
       {/* Hotkey legend */}
       <div className="drag border-t border-white/10 px-4 py-2 text-[10px] text-zinc-500">

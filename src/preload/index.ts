@@ -49,7 +49,8 @@ const api = {
   },
   sendAudioChunk: (kind: 'system' | 'mic', buffer: ArrayBuffer): void =>
     ipcRenderer.send('audio:chunk', kind, buffer),
-  audioStart: (mic: boolean): void => ipcRenderer.send('audio:start', mic),
+  audioStart: (mic: boolean, preferDiarization?: boolean): void =>
+    ipcRenderer.send('audio:start', mic, Boolean(preferDiarization)),
   audioStop: (): void => ipcRenderer.send('audio:stop'),
   onAudioStats: (callback: (stats: { system: number; mic: number }) => void): (() => void) => {
     const listener = (_event: unknown, stats: { system: number; mic: number }): void =>
