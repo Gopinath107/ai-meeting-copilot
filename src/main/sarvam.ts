@@ -1,6 +1,11 @@
 import WebSocket from 'ws'
 
-export type TranscriptHandler = (text: string, isFinal: boolean, speaker?: number) => void
+export type TranscriptHandler = (
+  text: string,
+  isFinal: boolean,
+  speaker?: number,
+  confidence?: number
+) => void
 
 /** Minimal shared shape so the app can use any ASR provider interchangeably. */
 export interface AsrStream {

@@ -26,12 +26,20 @@ let overlayWindow: BrowserWindow | null = null
 let tray: Tray | null = null
 let clickThrough = false
 let stealthOn = true
+// Guards reassertStealth() against re-entrancy (showInactive re-fires 'show').
+let reassertingStealth = false
 let aiAbort: AbortController | null = null
 const audioSamples = { system: 0, mic: 0 }
 let audioStatsTimer: ReturnType<typeof setInterval> | null = null
-// Meeting mode requests diarization-capable ASR (Deepgram) so several speakers
-// can be told apart; set per session when audio capture starts.
-let preferDiarization = false
+// Which speech-to-text provider the current session should use.
+//  - 'auto'     : Sarvam primary, Deepgram fallback (best for code-mixed speech)
+//  - 'deepgram' : force Deepgram (English accuracy + Speaker 1..N labels)
+//  - 'sarvam'   : force Sarvam (best Indian/code-mixed accuracy, no labels)
+type AsrProvider = 'auto' | 'deepgram' | 'sarvam'
+let asrProvider: AsrProvider = 'auto'
+// Domain terms (tech stack / product names) to bias Deepgram recognition toward
+// so meeting jargon isn't misheard. Set per session from the renderer.
+let asrKeyterms: string[] = []
 const asrStreams: { system: AsrStream | null; mic: AsrStream | null } = {
   system: null,
   mic: null
@@ -79,7 +87,15 @@ function createOverlayWindow(): void {
 
   overlayWindow.on('ready-to-show', () => {
     overlayWindow?.show()
+    // Content protection must be (re)applied AFTER the native window exists and
+    // is shown — setting it while show:false can fail to bind to the HWND, which
+    // is why the overlay could still leak into a screen share. Re-assert here.
+    reassertStealth()
   })
+
+  // Windows can reset the capture-exclusion affinity when a window is re-shown
+  // after hide(); re-assert stealth every time it becomes visible.
+  overlayWindow.on('show', () => reassertStealth())
 
   overlayWindow.webContents.setWindowOpenHandler((details) => {
     shell.openExternal(details.url)
@@ -106,9 +122,38 @@ function toggleClickThrough(): void {
   overlayWindow.webContents.send('hotkey', { action: 'click-through', value: clickThrough })
 }
 
+/**
+ * Re-apply the current stealth (capture-exclusion) state and keep the overlay
+ * visible to the user. Toggling Windows content protection on a transparent,
+ * always-on-top window can drop it out of the compositor, so after (re)applying
+ * we re-assert always-on-top and force a repaint/re-show so it never vanishes
+ * from the user's own screen.
+ */
+function reassertStealth(): void {
+  const win = overlayWindow
+  if (!win || win.isDestroyed()) return
+  // showInactive() below re-fires the 'show' event, which calls this function
+  // again — guard against that infinite recursion.
+  if (reassertingStealth) return
+  reassertingStealth = true
+  try {
+    win.setContentProtection(stealthOn)
+    win.setAlwaysOnTop(true, 'screen-saver')
+    win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+    if (win.isVisible()) {
+      // showInactive() re-composites the window without stealing focus, fixing
+      // the "overlay disappears after toggling stealth" case.
+      win.showInactive()
+      win.webContents.invalidate()
+    }
+  } finally {
+    reassertingStealth = false
+  }
+}
+
 function applyStealth(value: boolean): void {
   stealthOn = value
-  overlayWindow?.setContentProtection(value)
+  reassertStealth()
   overlayWindow?.webContents.send('stealth:changed', value)
   tray?.setToolTip(`Interview Copilot — ${value ? 'stealth ON (invisible)' : 'visible'}`)
 }
@@ -160,10 +205,17 @@ function startDeepgram(
   asrStreams[kind]?.close()
   const stream = new DeepgramStream({
     apiKey,
+    keyterms: asrKeyterms,
     allowInsecureTls: getSettings().allowInsecureTls,
     onOpen: () => sendTranscriptStatus(source, 'connected', 'Deepgram'),
-    onTranscript: (text, isFinal, speaker) =>
-      overlayWindow?.webContents.send('transcript:update', { source, text, isFinal, speaker }),
+    onTranscript: (text, isFinal, speaker, confidence) =>
+      overlayWindow?.webContents.send('transcript:update', {
+        source,
+        text,
+        isFinal,
+        speaker,
+        confidence
+      }),
     onError: (error) => {
       console.error(`Deepgram ${kind} error:`, error.message)
       sendTranscriptStatus(source, 'error', error.message)
@@ -183,7 +235,8 @@ function startSarvam(
   kind: 'system' | 'mic',
   source: 'interviewer' | 'you',
   sarvamApiKey: string,
-  deepgramApiKey: string
+  deepgramApiKey: string,
+  codeMixed = false
 ): void {
   asrStreams[kind]?.close()
   let opened = false
@@ -201,13 +254,23 @@ function startSarvam(
   }
   const stream = new SarvamStream({
     apiKey: sarvamApiKey,
+    // Code-mixed meetings (Indian languages + English in one sentence): let
+    // Sarvam auto-detect and transcribe the mixed speech instead of forcing
+    // English-only. Interview mode stays 'en-IN' (English, Indian accent).
+    language: codeMixed ? 'unknown' : 'en-IN',
     allowInsecureTls: getSettings().allowInsecureTls,
     onOpen: () => {
       opened = true
       sendTranscriptStatus(source, 'connected', 'Sarvam')
     },
-    onTranscript: (text, isFinal, speaker) =>
-      overlayWindow?.webContents.send('transcript:update', { source, text, isFinal, speaker }),
+    onTranscript: (text, isFinal, speaker, confidence) =>
+      overlayWindow?.webContents.send('transcript:update', {
+        source,
+        text,
+        isFinal,
+        speaker,
+        confidence
+      }),
     onError: (error) => {
       console.error(`Sarvam ${kind} error:`, error.message)
       if (opened) sendTranscriptStatus(source, 'error', error.message)
@@ -224,14 +287,30 @@ function startSarvam(
 
 function startAsr(kind: 'system' | 'mic', source: 'interviewer' | 'you'): void {
   const s = getSettings()
-  // Meeting mode prefers Deepgram because it supports diarization (Speaker 1..N),
-  // which is needed to tell several participants apart. Sarvam streaming has no
-  // diarization, so it is only used when Deepgram isn't available (or in
-  // interview mode, where a single interviewer needs no speaker separation).
-  if (preferDiarization && s.deepgramApiKey) {
-    startDeepgram(kind, source, s.deepgramApiKey)
-  } else if (s.sarvamApiKey) {
-    startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey)
+  // Force Deepgram when the user wants per-speaker labels (diarization). Good
+  // for English meetings where telling participants apart matters.
+  if (asrProvider === 'deepgram') {
+    if (s.deepgramApiKey) {
+      startDeepgram(kind, source, s.deepgramApiKey)
+    } else {
+      sendTranscriptStatus(source, 'error', 'Deepgram key not set (needed for speaker labels)')
+    }
+    return
+  }
+  // Force Sarvam for best accuracy on Indian / code-mixed speech (no labels).
+  if (asrProvider === 'sarvam') {
+    if (s.sarvamApiKey) {
+      startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, true)
+    } else if (s.deepgramApiKey) {
+      startDeepgram(kind, source, s.deepgramApiKey)
+    } else {
+      sendTranscriptStatus(source, 'error', 'Speech service not configured')
+    }
+    return
+  }
+  // 'auto': Sarvam primary (with code-mixed detection), Deepgram fallback.
+  if (s.sarvamApiKey) {
+    startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, true)
   } else if (s.deepgramApiKey) {
     startDeepgram(kind, source, s.deepgramApiKey)
   } else {
@@ -299,8 +378,9 @@ function setupAudio(): void {
       asrStreams[kind]?.send(buffer)
     }
   })
-  ipcMain.on('audio:start', (_event, mic: boolean, diarize?: boolean) => {
-    preferDiarization = Boolean(diarize)
+  ipcMain.on('audio:start', (_event, mic: boolean, provider?: AsrProvider, keyterms?: string[]) => {
+    asrProvider = provider === 'deepgram' || provider === 'sarvam' ? provider : 'auto'
+    asrKeyterms = Array.isArray(keyterms) ? keyterms.filter((t) => typeof t === 'string') : []
     audioSamples.system = 0
     audioSamples.mic = 0
     if (audioStatsTimer) clearInterval(audioStatsTimer)

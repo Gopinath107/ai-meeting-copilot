@@ -106,10 +106,87 @@ function isNoise(raw: string): boolean {
 // ASR models invent text during silence. We only accept a transcript when real
 // speech-level audio energy occurred on its source within this window (the
 // window covers the model's finalisation latency).
-const VOICE_WINDOW_MS = 2500
+const VOICE_WINDOW_MS = 1800
 // Speech must exceed the adaptive noise floor and this hard-minimum RMS.
-const SPEECH_RMS_MIN = 0.008
-const SPEECH_FLOOR_MULT = 2.5
+const SPEECH_RMS_MIN = 0.012
+const SPEECH_FLOOR_MULT = 3
+// Deepgram gives a per-utterance confidence (0-1). Real speech is typically
+// > 0.7; hallucinations over silence/noise score low. Drop finals below this.
+// (Sarvam sends no confidence, so its finals are undefined and skip this check.)
+const MIN_CONFIDENCE = 0.6
+
+// --- Long-meeting memory ----------------------------------------------------
+// A meeting can run up to ~2 hours, far more transcript than fits in one model
+// request. We keep a rolling summary of everything already discussed and only
+// send that summary plus the newest verbatim lines. Once this many un-summarised
+// finals build up (beyond the recent window kept verbatim), we fold them into
+// the running summary in the background.
+const SUMMARY_TRIGGER = 18
+// Most-recent finals always kept verbatim (never folded into the summary yet),
+// so the latest exchange stays exact for the AI.
+const SUMMARY_KEEP_RECENT = 12
+
+// Common software/architecture terms always sent as Deepgram keyterms so jargon
+// is transcribed correctly even when the user leaves the tech-stack field empty
+// (e.g. "Spring Boot" instead of "ring board"). Merged with the user's own
+// stack/context terms in buildKeyterms(). English-only, nova-3 feature.
+const DEFAULT_TECH_KEYTERMS = [
+  'Spring Boot',
+  'Spring',
+  'Hibernate',
+  'Java',
+  'Kotlin',
+  'JavaScript',
+  'TypeScript',
+  'Python',
+  'Node.js',
+  'Express',
+  'React',
+  'Angular',
+  'Vue',
+  'Next.js',
+  'PostgreSQL',
+  'MySQL',
+  'MongoDB',
+  'Redis',
+  'Kafka',
+  'RabbitMQ',
+  'Elasticsearch',
+  'Docker',
+  'Kubernetes',
+  'Microservices',
+  'REST API',
+  'GraphQL',
+  'gRPC',
+  'JWT',
+  'OAuth',
+  'OpenID Connect',
+  'JSON',
+  'YAML',
+  'SQL',
+  'NoSQL',
+  'CI/CD',
+  'Jenkins',
+  'Terraform',
+  'AWS',
+  'Azure',
+  'GCP',
+  'Lambda',
+  'DynamoDB',
+  'Nginx',
+  'API Gateway',
+  'load balancer',
+  'caching',
+  'authentication',
+  'authorization',
+  'endpoint',
+  'middleware',
+  'schema',
+  'migration',
+  'webhook',
+  'idempotency',
+  'rate limiting'
+]
 
 /**
  * Decide whether an interviewer utterance is a prompt that deserves an answer.
@@ -267,6 +344,11 @@ export default function OverlayView({
   // ----- Meeting mode -----
   const mode: SessionMode = config?.mode ?? 'interview'
   const isMeeting = mode === 'meeting'
+  // Speech provider for this session. Meeting defaults to Deepgram so each
+  // participant gets a Speaker 1..N label; Sarvam gives best code-mixed
+  // accuracy but no labels. 'auto' = Sarvam primary + Deepgram fallback.
+  type Provider = 'auto' | 'deepgram' | 'sarvam'
+  const [provider, setProvider] = useState<Provider>(isMeeting ? 'deepgram' : 'auto')
   const [analysis, setAnalysis] = useState('')
   const [autoAnalyze, setAutoAnalyze] = useState(isMeeting)
   const [activeTab, setActiveTab] = useState<'analysis' | 'answer'>(
@@ -274,7 +356,7 @@ export default function OverlayView({
   )
   // Which kind of AI request is currently streaming, so tokens land in the right
   // pane (the main process only runs one stream at a time).
-  const intentRef = useRef<'answer' | 'analyze'>('answer')
+  const intentRef = useRef<'answer' | 'analyze' | 'summarize'>('answer')
   const analysisAccRef = useRef('')
   const autoAnalyzeRef = useRef(autoAnalyze)
   const lastAnalyzedCountRef = useRef(0)
@@ -327,6 +409,15 @@ export default function OverlayView({
   const pendingUserRef = useRef<string | null>(null)
   const answerAccRef = useRef('')
 
+  // Long-meeting memory: a running prose summary of everything discussed earlier,
+  // plus how far into the finals it covers, so the AI keeps full context across a
+  // 2-hour session without us resending the entire transcript. Older lines are
+  // folded into `meetingSummaryRef` in the background; recent lines stay verbatim.
+  const meetingSummaryRef = useRef('')
+  const summarizedUptoRef = useRef(0)
+  const summarizeTargetRef = useRef(0)
+  const summaryAccRef = useRef('')
+
   function buildSystemPrompt(): string {
     if (isMeeting) return buildMeetingSystemPrompt()
     const role = config?.role?.trim()
@@ -336,6 +427,7 @@ export default function OverlayView({
     return [
       'You are an expert real-time interview assistant helping the candidate answer out loud.',
       'Reply in the first person AS the candidate, concise and natural.',
+      'The question comes from speech-to-text and may contain recognition errors, especially for technical terms (e.g. "ring board" means "Spring Boot", "power gres" means "PostgreSQL", "jason" means "JSON"). Infer the intended meaning and answer using the correct canonical terms rather than the literal mis-transcribed words.',
       'You are given the recent conversation as memory. If the candidate says things like "explain that", "add X", "optimise it", "make it shorter", or "that code", they mean YOUR previous answer — build on it directly instead of starting a new topic.',
       'Format every answer in Markdown so it is easy to scan: use short "-" bullet points for lists, steps, or multi-part answers, **bold** for key terms, and short paragraphs for narrative answers.',
       'For behavioural or scenario-based questions, answer with the STAR method (Situation, Task, Action, Result) in a natural spoken flow of about 60-120 words; bullets are optional here.',
@@ -380,6 +472,8 @@ export default function OverlayView({
       '',
       '[ANSWER] A question has been directed at me. Answer in the FIRST PERSON as me, in a clear, confident, senior voice, ready to say out loud. Lead with the direct answer, then 2-4 crisp supporting points. Use short "-" bullets for multi-part answers and fenced code blocks (with a language tag) for any code, commands, JSON, or SQL. Be precise and pragmatic, mention the key trade-off, and stay concise.',
       '',
+      'The transcript is machine-generated (speech-to-text) and WILL contain recognition errors, especially for technical terms and product names. Silently reconstruct the intended meaning before responding: interpret garbled words against the tech stack and project context below (for example "ring board" or "sprint boot" almost certainly means "Spring Boot"; "power gres" means "PostgreSQL"; "jason" means "JSON"; "cuber netties" means "Kubernetes"). Always reason about the speaker\'s INTENT, not the literal mis-transcribed words, and use the correct canonical term in your reply. If a word is truly ambiguous, pick the most likely meaning given the tech stack and proceed.',
+      '',
       'Rules for both: Never fabricate facts, numbers, names, APIs, or library behaviour — use only real, standard, documented technology, and if unsure say so or use a well-known correct alternative. Prefer precision over sounding impressive. Ground everything in the project context below.',
       name ? `My name: ${name}.` : '',
       role ? `My role: ${role}.` : '',
@@ -404,6 +498,78 @@ export default function OverlayView({
       })
       .join('\n')
   }
+
+  // Recent verbatim lines prefixed with the running summary of everything said
+  // earlier, so the AI always has the full history of the meeting — not just the
+  // last few sentences — even hours in.
+  function transcriptWithHistory(n: number): string {
+    const summary = meetingSummaryRef.current.trim()
+    const recent = recentTranscript(n)
+    if (!summary) return recent
+    const label = isMeeting ? 'meeting' : 'conversation'
+    return (
+      `Summary of what was discussed earlier in this ${label} (context — do not repeat it back):\n` +
+      `${summary}\n\n` +
+      `Most recent exchange (verbatim, continues from the summary above):\n${recent}`
+    )
+  }
+
+  // --- Rolling summariser (long-meeting memory) -----------------------------
+  // Runs opportunistically while the stream is idle. It folds older transcript
+  // lines into `meetingSummaryRef` so we keep full context without ever sending
+  // the whole 2-hour transcript to the model.
+  function buildSummarizerPrompt(): string {
+    return [
+      'You maintain a running summary of a long live meeting so an AI assistant keeps full context even after one or two hours.',
+      'You are given the summary so far and the newer transcript lines that follow it. Merge the new lines into the summary and return the UPDATED summary.',
+      'Preserve every durable fact: decisions, action items and owners, requirements, agreed designs/architecture, open questions, disagreements, numbers, dates, and key technical details. Drop small talk and filler.',
+      'Write terse notes under short bold headings such as **Context**, **Decisions**, **Open questions**, **Action items**. Keep the whole summary under ~350 words by compressing older points, never dropping important ones.',
+      'The transcript is speech-to-text and may contain recognition errors; silently correct obvious technical or product-term mistakes.',
+      'Output ONLY the updated summary text — no preamble, no commentary.'
+    ].join('\n')
+  }
+
+  function summarizeRange(fromIdx: number, toIdx: number): void {
+    const lines = finalsRef.current.slice(fromIdx, toIdx)
+    if (lines.length === 0) return
+    const text = lines
+      .map((l) => {
+        if (l.source !== 'interviewer') return `Me: ${l.text}`
+        const named = l.speaker != null ? speakerNamesRef.current[l.speaker]?.trim() : ''
+        const who = named
+          ? named
+          : `${isMeeting ? 'Speaker' : 'Interviewer'}${l.speaker != null ? ' ' + (l.speaker + 1) : ''}`
+        return `${who}: ${l.text}`
+      })
+      .join('\n')
+    intentRef.current = 'summarize'
+    summaryAccRef.current = ''
+    summarizeTargetRef.current = toIdx
+    setStreaming(true)
+    streamingRef.current = true
+    pendingUserRef.current = null
+    armWatchdog()
+    window.api.aiAsk([
+      { role: 'system', content: buildSummarizerPrompt() },
+      {
+        role: 'user',
+        content:
+          `Summary so far:\n${meetingSummaryRef.current.trim() || '(nothing summarised yet)'}\n\n` +
+          `New transcript lines to fold in:\n${text}\n\nReturn the updated running summary.`
+      }
+    ])
+  }
+
+  // If enough un-summarised lines have piled up (beyond the recent window we keep
+  // verbatim) and nothing else is streaming, fold them into the summary.
+  function maybeSummarize(): void {
+    if (streamingRef.current) return
+    const from = summarizedUptoRef.current
+    const to = finalsRef.current.length - SUMMARY_KEEP_RECENT
+    if (to - from < SUMMARY_TRIGGER) return
+    summarizeRange(from, to)
+  }
+
 
   // Safety net: if the backend goes silent (dropped stream / stall) the UI must
   // never stay locked in "streaming" — otherwise every guarded ask is blocked.
@@ -468,7 +634,7 @@ export default function OverlayView({
   function analyzeDiscussion(): void {
     if (finalsRef.current.length === 0) return
     streamAnalysis(
-      `[ANALYZE] Here is the recent meeting discussion:\n${recentTranscript(16)}\n\nAnalyse it now using the ANALYZE format.`
+      `[ANALYZE] Here is the meeting discussion so far:\n${transcriptWithHistory(16)}\n\nAnalyse the latest discussion now using the ANALYZE format, taking the earlier context into account.`
     )
   }
 
@@ -476,19 +642,19 @@ export default function OverlayView({
     if (finalsRef.current.length === 0) return
     if (isMeeting) {
       streamAnswer(
-        `[ANSWER] Recent meeting discussion:\n${recentTranscript(14)}\n\nA question has been directed at me. Answer the most recent question aimed at me, in the first person, ready to say out loud.`
+        `[ANSWER] Meeting discussion so far:\n${transcriptWithHistory(14)}\n\nA question has been directed at me. Answer the most recent question aimed at me, in the first person, ready to say out loud. Use the earlier context above if the question refers back to it.`
       )
       return
     }
     streamAnswer(
-      `Interview transcript so far:\n${recentTranscript(14)}\n\nAnswer the interviewer's most recent question thoroughly. If they asked several questions, address each one.`
+      `Interview transcript so far:\n${transcriptWithHistory(14)}\n\nAnswer the interviewer's most recent question thoroughly. If they asked several questions, address each one.`
     )
   }
 
   function askManual(): void {
     const q = manualQuestion.trim()
     if (!q) return
-    const ctx = recentTranscript(8)
+    const ctx = transcriptWithHistory(8)
     const user = isMeeting
       ? (ctx ? `[ANSWER] Recent meeting discussion (context):\n${ctx}\n\n` : '[ANSWER] ') +
         `Answer this for me, in the first person, ready to say out loud:\n"${q}"`
@@ -514,7 +680,10 @@ export default function OverlayView({
   useEffect(() => {
     const offToken = window.api.onAiToken((t) => {
       armWatchdog()
-      if (intentRef.current === 'analyze') {
+      if (intentRef.current === 'summarize') {
+        // Background memory update — accumulate silently, never touch the UI.
+        summaryAccRef.current += t
+      } else if (intentRef.current === 'analyze') {
         analysisAccRef.current += t
         setAnalysis((prev) => prev + t)
       } else {
@@ -527,7 +696,14 @@ export default function OverlayView({
       setStreaming(false)
       streamingRef.current = false
       // Only answers become conversation memory; analysis is stateless.
-      if (intentRef.current === 'answer') {
+      if (intentRef.current === 'summarize') {
+        const s = summaryAccRef.current.trim()
+        if (s) {
+          meetingSummaryRef.current = s
+          summarizedUptoRef.current = summarizeTargetRef.current
+        }
+        summaryAccRef.current = ''
+      } else if (intentRef.current === 'answer') {
         const user = pendingUserRef.current
         const answer = answerAccRef.current.trim()
         if (user && answer) {
@@ -541,9 +717,20 @@ export default function OverlayView({
         }
       }
       pendingUserRef.current = null
+      // Now that the stream is idle, fold any backlog of older lines into memory.
+      setTimeout(() => maybeSummarize(), 0)
     })
     const offErr = window.api.onAiError((m) => {
       clearWatchdog()
+      // A failed background summarise must stay silent — keep the old summary and
+      // retry later rather than showing an error over the transcript.
+      if (intentRef.current === 'summarize') {
+        setStreaming(false)
+        streamingRef.current = false
+        summaryAccRef.current = ''
+        pendingUserRef.current = null
+        return
+      }
       setAiError(m)
       setStreaming(false)
       streamingRef.current = false
@@ -555,6 +742,15 @@ export default function OverlayView({
       offDone()
       offErr()
     }
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [])
+
+  // Long-meeting memory: periodically fold older transcript into the running
+  // summary while the stream is idle, so context survives a 2-hour session even
+  // if the user turns auto-analyse/answer off.
+  useEffect(() => {
+    const id = setInterval(() => maybeSummarize(), 15000)
+    return () => clearInterval(id)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
 
@@ -608,16 +804,20 @@ export default function OverlayView({
   }, [finals])
 
   useEffect(() => {
-    const offT = window.api.onTranscript(({ source, text, isFinal, speaker }) => {
+    const offT = window.api.onTranscript(({ source, text, isFinal, speaker, confidence }) => {
       const kind: AudioSourceKind = source === 'interviewer' ? 'system' : 'mic'
       // Voice-activity gate: if no speech-level audio energy occurred on this
       // source recently, the model invented this text over silence — ignore it.
       const heardVoice = Date.now() - vadRef.current[kind].lastVoiceTs <= VOICE_WINDOW_MS
+      // Confidence gate: Deepgram reports how sure it is (0-1). Low-confidence
+      // finals are almost always hallucinations over silence/noise — drop them.
+      const lowConfidence = typeof confidence === 'number' && confidence < MIN_CONFIDENCE
       if (isFinal) {
         // Drop hallucinated filler so it neither clutters the transcript nor
         // triggers a phantom auto-answer when nobody is really speaking.
-        if (!heardVoice || isNoise(text)) {
+        if (!heardVoice || lowConfidence || isNoise(text)) {
           if (!heardVoice) console.debug('[vad] dropped silent hallucination:', text)
+          if (lowConfidence) console.debug('[conf] dropped low-confidence text:', confidence, text)
           setInterim((prev) => ({ ...prev, [source]: '' }))
           return
         }
@@ -671,6 +871,35 @@ export default function OverlayView({
     }
   }
 
+  // Build Deepgram keyterms from the session so domain jargon (tech stack,
+  // product/feature names) is recognised accurately instead of misheard. We take
+  // the tech stack plus multi-word / capitalised / dotted terms from the project
+  // context (e.g. "OAuth", "PostgreSQL", "login page"), de-duplicated and capped.
+  function buildKeyterms(): string[] {
+    const terms = new Set<string>(DEFAULT_TECH_KEYTERMS)
+    const addList = (s?: string): void => {
+      for (const part of (s ?? '').split(/[,;\n/|]+/)) {
+        const t = part.trim()
+        if (t.length >= 2 && t.length <= 40) terms.add(t)
+      }
+    }
+    addList(config?.techStack)
+    const ctx = config?.projectContext ?? ''
+    // Capture 1-3 word Capitalised phrases ("Spring Boot", "React Native"),
+    // CamelCase ("PostgreSQL"), and dotted tech tokens ("node.js") as single
+    // keyterms — feeding the whole phrase is what makes Deepgram recognise it.
+    const phrase = /\b([A-Z][a-zA-Z0-9.+#]*(?:\s+[A-Z][a-zA-Z0-9.+#]*){0,2})\b/g
+    const dotted = /\b([a-zA-Z]+(?:\.[a-zA-Z]+)+)\b/g
+    for (const re of [phrase, dotted]) {
+      for (const m of ctx.match(re) ?? []) {
+        const t = m.trim()
+        if (t.length >= 2 && t.length <= 40) terms.add(t)
+      }
+    }
+    if (config?.role) terms.add(config.role)
+    return [...terms].slice(0, 80)
+  }
+
   async function startCapture(): Promise<void> {
     setAudioError(null)
     setFinals([])
@@ -691,7 +920,7 @@ export default function OverlayView({
       onError: (kind, err) => setAudioError(`${kind}: ${err.message}`)
     })
     captureRef.current = capture
-    window.api.audioStart(micEnabled, isMeeting)
+    window.api.audioStart(micEnabled, provider, buildKeyterms())
     setCapturing(true)
     try {
       await capture.startSystem()
@@ -796,6 +1025,19 @@ export default function OverlayView({
           >
             Mic {micEnabled ? 'on' : 'off'}
           </button>
+          {isMeeting && (
+            <select
+              value={provider}
+              onChange={(e) => setProvider(e.target.value as Provider)}
+              disabled={capturing}
+              title="Choose the speech engine. Deepgram labels each speaker; Sarvam is most accurate for mixed Indian speech but can't separate speakers."
+              className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 focus:border-indigo-400/50 focus:outline-none disabled:opacity-50"
+            >
+              <option value="deepgram">Deepgram · speaker labels</option>
+              <option value="sarvam">Sarvam · best accuracy</option>
+              <option value="auto">Auto (Sarvam + fallback)</option>
+            </select>
+          )}
           {audioError && (
             <span className="truncate text-[10px] text-red-300" title={audioError}>
               {audioError}

@@ -1,6 +1,11 @@
 import WebSocket from 'ws'
 
-export type TranscriptHandler = (text: string, isFinal: boolean, speaker?: number) => void
+export type TranscriptHandler = (
+  text: string,
+  isFinal: boolean,
+  speaker?: number,
+  confidence?: number
+) => void
 
 /** Pick the speaker (Deepgram diarization index) that owns most words in an utterance. */
 function dominantSpeaker(words: unknown): number | undefined {
@@ -25,6 +30,12 @@ export interface DeepgramOptions {
   apiKey: string
   sampleRate?: number
   language?: string
+  /**
+   * Domain terms (product names, tech stack, jargon) to bias recognition toward.
+   * Uses nova-3 Keyterm Prompting — English only — so words like "JWT", "OAuth",
+   * or "Kubernetes" are transcribed correctly instead of being misheard.
+   */
+  keyterms?: string[]
   onTranscript: TranscriptHandler
   onOpen?: () => void
   onError?: (error: Error) => void
@@ -47,21 +58,34 @@ export class DeepgramStream {
   private readonly url: string
 
   constructor(private readonly opts: DeepgramOptions) {
+    const language = opts.language ?? 'en'
     const params = new URLSearchParams({
-      model: 'nova-2',
+      // nova-3 is Deepgram's most accurate model — noticeably better than
+      // nova-2 for real conversational speech and accented English.
+      model: 'nova-3',
       encoding: 'linear16',
       sample_rate: String(opts.sampleRate ?? 16000),
       channels: '1',
-      // 'en' is Deepgram's multidialect English model — English-only, and it
-      // handles mixed Indian + American/native accents in one model (the
-      // interview is ~80% Indian-accented English, ~20% American English).
-      language: opts.language ?? 'en',
+      // 'en' = nova-3 English (multidialect) — the most accurate choice for
+      // English-only meetings, and it handles Indian + American/native accents
+      // in one model. Switch to 'multi' only if speech is genuinely code-mixed.
+      language,
       interim_results: 'true',
       smart_format: 'true',
       punctuate: 'true',
       diarize: 'true',
-      endpointing: '300'
+      // Give a slightly longer silence gap before finalising so full sentences
+      // aren't chopped mid-thought (helps accuracy of multi-speaker meetings).
+      endpointing: '400'
     })
+    // Keyterm Prompting is a nova-3 English-only feature. Feed the meeting's
+    // tech stack / product terms so domain jargon is recognised accurately.
+    if (language === 'en' && opts.keyterms?.length) {
+      for (const term of opts.keyterms.slice(0, 100)) {
+        const t = term.trim()
+        if (t) params.append('keyterm', t)
+      }
+    }
     this.url = `wss://api.deepgram.com/v1/listen?${params.toString()}`
   }
 
@@ -88,7 +112,8 @@ export class DeepgramStream {
         const alt = msg?.channel?.alternatives?.[0]
         const text: unknown = alt?.transcript
         if (typeof text === 'string' && text.trim().length > 0) {
-          this.opts.onTranscript(text, Boolean(msg.is_final), dominantSpeaker(alt?.words))
+          const conf = typeof alt?.confidence === 'number' ? alt.confidence : undefined
+          this.opts.onTranscript(text, Boolean(msg.is_final), dominantSpeaker(alt?.words), conf)
         }
       } catch {
         // Metadata / non-JSON frames are ignored.

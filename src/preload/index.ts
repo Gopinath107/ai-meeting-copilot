@@ -8,6 +8,7 @@ export type TranscriptUpdate = {
   text: string
   isFinal: boolean
   speaker?: number
+  confidence?: number
 }
 export type TranscriptStatus = { source: TranscriptSource; status: string; message?: string }
 export type AiMessage = { role: 'system' | 'user' | 'assistant'; content: string }
@@ -49,8 +50,8 @@ const api = {
   },
   sendAudioChunk: (kind: 'system' | 'mic', buffer: ArrayBuffer): void =>
     ipcRenderer.send('audio:chunk', kind, buffer),
-  audioStart: (mic: boolean, preferDiarization?: boolean): void =>
-    ipcRenderer.send('audio:start', mic, Boolean(preferDiarization)),
+  audioStart: (mic: boolean, provider?: 'auto' | 'deepgram' | 'sarvam', keyterms?: string[]): void =>
+    ipcRenderer.send('audio:start', mic, provider ?? 'auto', keyterms ?? []),
   audioStop: (): void => ipcRenderer.send('audio:stop'),
   onAudioStats: (callback: (stats: { system: number; mic: number }) => void): (() => void) => {
     const listener = (_event: unknown, stats: { system: number; mic: number }): void =>
