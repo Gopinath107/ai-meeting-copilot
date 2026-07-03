@@ -26,6 +26,40 @@ function dominantSpeaker(words: unknown): number | undefined {
   return best
 }
 
+type SpeakerSegment = { speaker: number | undefined; text: string }
+
+/**
+ * When two people talk in one burst, Deepgram often returns their words merged
+ * into a SINGLE result. Collapsing that to one "dominant" speaker mislabels and
+ * runs their sentences together. Instead, split the word list into consecutive
+ * same-speaker segments so each speaker's words are attributed correctly — a big
+ * accuracy win for fast Speaker 1 ↔ Speaker 2 exchanges.
+ */
+function splitBySpeaker(words: unknown): SpeakerSegment[] {
+  if (!Array.isArray(words) || words.length === 0) return []
+  const segs: { speaker: number | undefined; tokens: string[] }[] = []
+  let cur: { speaker: number | undefined; tokens: string[] } | null = null
+  for (const w of words) {
+    const word = w as { speaker?: unknown; word?: unknown; punctuated_word?: unknown }
+    const sp = typeof word.speaker === 'number' ? word.speaker : undefined
+    const token = (
+      typeof word.punctuated_word === 'string'
+        ? word.punctuated_word
+        : typeof word.word === 'string'
+          ? word.word
+          : ''
+    ).trim()
+    if (!token) continue
+    if (cur && cur.speaker === sp) {
+      cur.tokens.push(token)
+    } else {
+      cur = { speaker: sp, tokens: [token] }
+      segs.push(cur)
+    }
+  }
+  return segs.map((s) => ({ speaker: s.speaker, text: s.tokens.join(' ') }))
+}
+
 export interface DeepgramOptions {
   apiKey: string
   sampleRate?: number
@@ -74,6 +108,9 @@ export class DeepgramStream {
       smart_format: 'true',
       punctuate: 'true',
       diarize: 'true',
+      // Format spoken numbers as digits ("twenty twenty five" -> "2025") so
+      // versions, ports, quantities and dates in the transcript are accurate.
+      numerals: 'true',
       // Give a slightly longer silence gap before finalising so full sentences
       // aren't chopped mid-thought (helps accuracy of multi-speaker meetings).
       endpointing: '400'
@@ -113,7 +150,25 @@ export class DeepgramStream {
         const text: unknown = alt?.transcript
         if (typeof text === 'string' && text.trim().length > 0) {
           const conf = typeof alt?.confidence === 'number' ? alt.confidence : undefined
-          this.opts.onTranscript(text, Boolean(msg.is_final), dominantSpeaker(alt?.words), conf)
+          const isFinal = Boolean(msg.is_final)
+          // On a finalised result, split any merged multi-speaker utterance into
+          // one line per speaker so each participant's words are attributed
+          // correctly. Only do this when diarization is reliable (a small number
+          // of segments); if it flip-flops, fall back to the dominant speaker to
+          // avoid choppy fragments.
+          if (isFinal) {
+            const segments = splitBySpeaker(alt?.words)
+            const speakers = new Set(segments.map((s) => s.speaker))
+            if (speakers.size > 1 && segments.length <= speakers.size * 3) {
+              for (const seg of segments) {
+                if (seg.text.trim().length > 0) {
+                  this.opts.onTranscript(seg.text, true, seg.speaker, conf)
+                }
+              }
+              return
+            }
+          }
+          this.opts.onTranscript(text, isFinal, dominantSpeaker(alt?.words), conf)
         }
       } catch {
         // Metadata / non-JSON frames are ignored.

@@ -1,4 +1,4 @@
-import { useEffect, useMemo, useRef, useState } from 'react'
+import { useEffect, useRef, useState } from 'react'
 import type { SessionConfig, SessionMode } from '../App'
 import { AudioCapture, type AudioSourceKind } from '../audio/AudioCapture'
 import { Markdown } from '../components/Markdown'
@@ -107,6 +107,12 @@ function isNoise(raw: string): boolean {
 // speech-level audio energy occurred on its source within this window (the
 // window covers the model's finalisation latency).
 const VOICE_WINDOW_MS = 1800
+// Sarvam runs its OWN server-side voice-activity detection and finalises an
+// utterance in a batch shortly AFTER the speaker pauses — often after the strict
+// window above has lapsed. Sarvam therefore gets a much wider window so its valid
+// finals aren't wrongly dropped as "silence hallucinations" (it barely
+// hallucinates over true silence, unlike Whisper/Deepgram-style engines).
+const SARVAM_VOICE_WINDOW_MS = 6000
 // Speech must exceed the adaptive noise floor and this hard-minimum RMS.
 const SPEECH_RMS_MIN = 0.012
 const SPEECH_FLOOR_MULT = 3
@@ -114,6 +120,18 @@ const SPEECH_FLOOR_MULT = 3
 // > 0.7; hallucinations over silence/noise score low. Drop finals below this.
 // (Sarvam sends no confidence, so its finals are undefined and skip this check.)
 const MIN_CONFIDENCE = 0.6
+
+// --- Meeting auto-response timing -------------------------------------------
+// Meeting mode fires the AI on a natural pause (debounce), but during a fast
+// multi-speaker back-and-forth those pauses are rare, so a hard cap forces a
+// timely response even while people keep talking.
+// Pause after the last line before we treat the turn as over (general case).
+const AUTO_SILENCE_MS = 1100
+// Shorter wait when a question was clearly directed at me — respond faster.
+const AUTO_DIRECTED_MS = 700
+// Hard cap: once a burst starts, respond within this long no matter how
+// continuously Speaker 1 and Speaker 2 keep talking.
+const AUTO_MAX_WAIT_MS = 3800
 
 // --- Long-meeting memory ----------------------------------------------------
 // A meeting can run up to ~2 hours, far more transcript than fits in one model
@@ -344,11 +362,14 @@ export default function OverlayView({
   // ----- Meeting mode -----
   const mode: SessionMode = config?.mode ?? 'interview'
   const isMeeting = mode === 'meeting'
-  // Speech provider for this session. Meeting defaults to Deepgram so each
-  // participant gets a Speaker 1..N label; Sarvam gives best code-mixed
-  // accuracy but no labels. 'auto' = Sarvam primary + Deepgram fallback.
+  // Speech provider for this session. Deepgram is the default in BOTH modes: its
+  // nova-3 English model is multidialect (British/UK, American and other native
+  // accents) and the most accurate choice for ~100% English speech, and it also
+  // labels each speaker. Sarvam's only English model is en-IN (Indian-accent
+  // tuned), so it's offered as an option but not the default. 'auto' = Sarvam
+  // primary + Deepgram fallback.
   type Provider = 'auto' | 'deepgram' | 'sarvam'
-  const [provider, setProvider] = useState<Provider>(isMeeting ? 'deepgram' : 'auto')
+  const [provider, setProvider] = useState<Provider>('deepgram')
   const [analysis, setAnalysis] = useState('')
   const [autoAnalyze, setAutoAnalyze] = useState(isMeeting)
   const [activeTab, setActiveTab] = useState<'analysis' | 'answer'>(
@@ -356,8 +377,15 @@ export default function OverlayView({
   )
   // Which kind of AI request is currently streaming, so tokens land in the right
   // pane (the main process only runs one stream at a time).
-  const intentRef = useRef<'answer' | 'analyze' | 'summarize'>('answer')
+  const intentRef = useRef<'answer' | 'analyze' | 'summarize' | 'minutes'>('answer')
   const analysisAccRef = useRef('')
+  // Minutes of Meeting: generated on demand when the meeting is ended, from the
+  // full transcript. Shown in a modal overlay so it never disrupts the live UI.
+  const [minutes, setMinutes] = useState('')
+  const [minutesOpen, setMinutesOpen] = useState(false)
+  const [minutesError, setMinutesError] = useState<string | null>(null)
+  const [minutesCopied, setMinutesCopied] = useState(false)
+  const minutesAccRef = useRef('')
   const autoAnalyzeRef = useRef(autoAnalyze)
   const lastAnalyzedCountRef = useRef(0)
   useEffect(() => {
@@ -398,6 +426,11 @@ export default function OverlayView({
   // pause ("what is the gap... in Python") can't be mistaken for the end. This
   // gives a single answer per question instead of one per fragment.
   const autoTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
+  // Hard cap for meeting mode: armed once when a burst of speech starts and NOT
+  // reset by later lines, so a fast back-and-forth between Speaker 1 and Speaker
+  // 2 (gaps shorter than the pause window) still triggers a timely response
+  // instead of waiting for a real silence that may never come.
+  const maxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const turnHasQuestionRef = useRef(false)
   const turnDirectedRef = useRef(false)
 
@@ -638,6 +671,30 @@ export default function OverlayView({
     )
   }
 
+  // Meeting mode trigger: runs when the pause debounce OR the hard cap fires.
+  // Clears both timers, then answers (if a question was aimed at me) or analyses
+  // the discussion. If a stream is already running we skip — the next line will
+  // re-arm the timers, so nothing is lost.
+  function fireMeetingAuto(): void {
+    if (autoTimerRef.current) {
+      clearTimeout(autoTimerRef.current)
+      autoTimerRef.current = null
+    }
+    if (maxWaitTimerRef.current) {
+      clearTimeout(maxWaitTimerRef.current)
+      maxWaitTimerRef.current = null
+    }
+    const directed = turnDirectedRef.current
+    turnDirectedRef.current = false
+    if (streamingRef.current) return
+    if (directed && autoAnswerRef.current) {
+      askAi()
+    } else if (autoAnalyzeRef.current) {
+      // Only analyse once there is enough fresh discussion to be worth it.
+      if (finalsRef.current.length - lastAnalyzedCountRef.current >= 2) analyzeDiscussion()
+    }
+  }
+
   function askAi(): void {
     if (finalsRef.current.length === 0) return
     if (isMeeting) {
@@ -672,6 +729,84 @@ export default function OverlayView({
     pendingUserRef.current = null
   }
 
+  // --- Minutes of Meeting ---------------------------------------------------
+  // System prompt that turns the raw transcript into structured, professional
+  // meeting minutes. Grounded in the session's project/stack context so garbled
+  // technical terms are corrected and nothing is invented.
+  function buildMinutesPrompt(): string {
+    const role = config?.role?.trim()
+    const project = config?.projectContext?.trim()
+    const stack = config?.techStack?.trim()
+    const docs = config?.docsText?.trim()
+    return [
+      'You are an expert meeting secretary. Produce accurate, professional Minutes of Meeting (MoM) from the raw speech-to-text transcript provided.',
+      'The transcript is machine-generated and will contain recognition errors, especially for technical and product terms — silently correct them to the intended canonical terms using the project context and tech stack below (for example "ring board" means "Spring Boot", "power gres" means "PostgreSQL", "jason" means "JSON").',
+      'Output ONLY the minutes in clean Markdown — no preamble and no closing remarks. Use these sections in order, and omit any section that has nothing substantive:',
+      '# Minutes of Meeting',
+      '**Attendees:** the participants, using the speaker names/labels that appear in the transcript.',
+      '## Summary',
+      'A short paragraph (3-5 sentences) capturing the purpose and outcome of the meeting.',
+      '## Key Discussion Points',
+      'Concise bullets of the main topics discussed and the important details of each.',
+      '## Decisions Made',
+      'Each concrete decision that was agreed, as a bullet.',
+      '## Action Items',
+      'A checklist in the form "- [ ] Task — Owner (due date if mentioned)". Only include real tasks that were actually assigned or agreed.',
+      '## Open Questions / Follow-ups',
+      'Any unresolved questions or items to revisit.',
+      'Be strictly faithful to what was actually said — never invent decisions, owners, dates, numbers, or facts that are not in the transcript. Skip greetings, small talk, and filler.',
+      role ? `Host role context: ${role}.` : '',
+      project ? `Project / application context:\n${project}` : '',
+      stack ? `Tech stack: ${stack}.` : '',
+      docs ? `Reference docs:\n${docs}` : ''
+    ]
+      .filter(Boolean)
+      .join('\n')
+  }
+
+  // Called by the "End & Minutes" button. Stops capture, then asks the LLM to
+  // turn the entire transcript (every finalised line) into minutes, streamed
+  // into the minutes modal.
+  function generateMinutes(): void {
+    setMinutesError(null)
+    setMinutesOpen(true)
+    if (finalsRef.current.length === 0) {
+      setMinutes('')
+      setMinutesError('No transcript yet — start listening and capture the meeting first.')
+      return
+    }
+    if (capturing) stopCapture()
+    if (streamingRef.current) window.api.aiCancel()
+    intentRef.current = 'minutes'
+    minutesAccRef.current = ''
+    setMinutes('')
+    setStreaming(true)
+    streamingRef.current = true
+    pendingUserRef.current = null
+    armWatchdog()
+    // finals holds every line ever transcribed, so this is the complete meeting.
+    const full = recentTranscript(finalsRef.current.length)
+    window.api.aiAsk([
+      { role: 'system', content: buildMinutesPrompt() },
+      {
+        role: 'user',
+        content: `Here is the full meeting transcript:\n\n${full}\n\nGenerate the Minutes of Meeting now, following the required format.`
+      }
+    ])
+  }
+
+  async function copyMinutes(): Promise<void> {
+    const text = minutesAccRef.current || minutes
+    if (!text) return
+    try {
+      await navigator.clipboard.writeText(text)
+      setMinutesCopied(true)
+      setTimeout(() => setMinutesCopied(false), 1500)
+    } catch {
+      // Clipboard may be unavailable; ignore silently.
+    }
+  }
+
   useEffect(() => {
     const off = window.api.onAudioStats((s) => setSeconds(s))
     return off
@@ -683,6 +818,9 @@ export default function OverlayView({
       if (intentRef.current === 'summarize') {
         // Background memory update — accumulate silently, never touch the UI.
         summaryAccRef.current += t
+      } else if (intentRef.current === 'minutes') {
+        minutesAccRef.current += t
+        setMinutes((prev) => prev + t)
       } else if (intentRef.current === 'analyze') {
         analysisAccRef.current += t
         setAnalysis((prev) => prev + t)
@@ -731,6 +869,15 @@ export default function OverlayView({
         pendingUserRef.current = null
         return
       }
+      // A failed minutes generation is shown inside the minutes modal.
+      if (intentRef.current === 'minutes') {
+        setMinutesError(m)
+        setStreaming(false)
+        streamingRef.current = false
+        minutesAccRef.current = ''
+        pendingUserRef.current = null
+        return
+      }
       setAiError(m)
       setStreaming(false)
       streamingRef.current = false
@@ -765,22 +912,19 @@ export default function OverlayView({
 
     if (isMeeting) {
       // Meeting mode runs off two independent toggles, so don't early-return on
-      // autoAnswer. Track whether this turn was aimed at me, then on silence
-      // either draft an answer (aimed at me) or analyse the discussion.
+      // autoAnswer. Track whether this turn was aimed at me, then either draft an
+      // answer (aimed at me) or analyse the discussion.
       if (isDirectedAtMe(last.text, config?.userName)) turnDirectedRef.current = true
+      // Debounce: (re)arm the "they've stopped talking" pause timer. Use a
+      // shorter wait when a question is aimed at me so I get an answer faster.
       if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
-      autoTimerRef.current = setTimeout(() => {
-        autoTimerRef.current = null
-        const directed = turnDirectedRef.current
-        turnDirectedRef.current = false
-        if (streamingRef.current) return
-        if (directed && autoAnswerRef.current) {
-          askAi()
-        } else if (autoAnalyzeRef.current) {
-          // Only analyse once there is enough fresh discussion to be worth it.
-          if (finalsRef.current.length - lastAnalyzedCountRef.current >= 2) analyzeDiscussion()
-        }
-      }, 1600)
+      const wait = turnDirectedRef.current ? AUTO_DIRECTED_MS : AUTO_SILENCE_MS
+      autoTimerRef.current = setTimeout(fireMeetingAuto, wait)
+      // Hard cap: arm ONCE at the start of a burst and never reset it, so a fast
+      // Speaker 1 ↔ Speaker 2 exchange (no long pause) still fires in time.
+      if (!maxWaitTimerRef.current) {
+        maxWaitTimerRef.current = setTimeout(fireMeetingAuto, AUTO_MAX_WAIT_MS)
+      }
       // eslint-disable-next-line react-hooks/exhaustive-deps
       return
     }
@@ -806,9 +950,14 @@ export default function OverlayView({
   useEffect(() => {
     const offT = window.api.onTranscript(({ source, text, isFinal, speaker, confidence }) => {
       const kind: AudioSourceKind = source === 'interviewer' ? 'system' : 'mic'
+      // Sarvam sends no confidence (its finals are undefined) and does its own
+      // server-side VAD, so it needs a wider local window; confidence-bearing
+      // engines (Deepgram) keep the strict window to catch their hallucinations.
+      const serverVad = typeof confidence !== 'number'
+      const voiceWindow = serverVad ? SARVAM_VOICE_WINDOW_MS : VOICE_WINDOW_MS
       // Voice-activity gate: if no speech-level audio energy occurred on this
       // source recently, the model invented this text over silence — ignore it.
-      const heardVoice = Date.now() - vadRef.current[kind].lastVoiceTs <= VOICE_WINDOW_MS
+      const heardVoice = Date.now() - vadRef.current[kind].lastVoiceTs <= voiceWindow
       // Confidence gate: Deepgram reports how sure it is (0-1). Low-confidence
       // finals are almost always hallucinations over silence/noise — drop them.
       const lowConfidence = typeof confidence === 'number' && confidence < MIN_CONFIDENCE
@@ -857,6 +1006,8 @@ export default function OverlayView({
     return () => {
       captureRef.current?.stop()
       window.api.audioStop()
+      if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
+      if (maxWaitTimerRef.current) clearTimeout(maxWaitTimerRef.current)
     }
   }, [])
 
@@ -942,6 +1093,15 @@ export default function OverlayView({
     window.api.audioStop()
     setCapturing(false)
     setLevels({ system: 0, mic: 0 })
+    // Cancel any pending auto-response timers so they can't fire after we stop.
+    if (autoTimerRef.current) {
+      clearTimeout(autoTimerRef.current)
+      autoTimerRef.current = null
+    }
+    if (maxWaitTimerRef.current) {
+      clearTimeout(maxWaitTimerRef.current)
+      maxWaitTimerRef.current = null
+    }
   }
 
   useEffect(() => {
@@ -951,14 +1111,6 @@ export default function OverlayView({
     return off
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [])
-
-  // Speaker indices seen so far (interviewer/meeting audio only), so the UI can
-  // offer a name box per participant as they start talking.
-  const seenSpeakers = useMemo(() => {
-    const set = new Set<number>()
-    for (const f of finals) if (f.source === 'interviewer' && f.speaker != null) set.add(f.speaker)
-    return [...set].sort((a, b) => a - b)
-  }, [finals])
 
   return (
     <div className="flex h-full flex-col">
@@ -1017,6 +1169,14 @@ export default function OverlayView({
             {capturing ? 'Stop listening' : 'Start listening'}
           </button>
           <button
+            onClick={generateMinutes}
+            disabled={streaming && intentRef.current === 'minutes'}
+            title="End the meeting and generate the Minutes of Meeting from the full transcript"
+            className="rounded-md bg-amber-500/90 px-3 py-1 text-xs font-semibold text-white hover:bg-amber-400 disabled:opacity-40"
+          >
+            {capturing ? 'End & Minutes' : 'Minutes of Meeting'}
+          </button>
+          <button
             onClick={() => setMicEnabled((v) => !v)}
             disabled={capturing}
             className={`rounded-md px-2 py-1 text-xs ${
@@ -1025,19 +1185,17 @@ export default function OverlayView({
           >
             Mic {micEnabled ? 'on' : 'off'}
           </button>
-          {isMeeting && (
-            <select
-              value={provider}
-              onChange={(e) => setProvider(e.target.value as Provider)}
-              disabled={capturing}
-              title="Choose the speech engine. Deepgram labels each speaker; Sarvam is most accurate for mixed Indian speech but can't separate speakers."
-              className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 focus:border-indigo-400/50 focus:outline-none disabled:opacity-50"
-            >
-              <option value="deepgram">Deepgram · speaker labels</option>
-              <option value="sarvam">Sarvam · best accuracy</option>
-              <option value="auto">Auto (Sarvam + fallback)</option>
-            </select>
-          )}
+          <select
+            value={provider}
+            onChange={(e) => setProvider(e.target.value as Provider)}
+            disabled={capturing}
+            title="Choose the speech engine. Deepgram handles all English accents (American, British/UK, Indian and other native accents) and labels each speaker; Sarvam's only English model is Indian-accent tuned and can't separate speakers."
+            className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 focus:border-indigo-400/50 focus:outline-none disabled:opacity-50"
+          >
+            <option value="deepgram">Deepgram · English + labels</option>
+            <option value="sarvam">Sarvam · Indian English</option>
+            <option value="auto">Auto (Sarvam + fallback)</option>
+          </select>
           {audioError && (
             <span className="truncate text-[10px] text-red-300" title={audioError}>
               {audioError}
@@ -1056,27 +1214,6 @@ export default function OverlayView({
           )}
         </div>
       </div>
-
-      {/* Speaker name mapping (meeting mode) */}
-      {isMeeting && seenSpeakers.length > 0 && (
-        <div className="no-drag mx-3 mb-2 flex flex-wrap items-center gap-1.5 rounded-xl border border-white/10 bg-black/20 p-2">
-          <span className="text-[10px] font-medium uppercase tracking-wide text-zinc-500">
-            Names
-          </span>
-          {seenSpeakers.map((sp) => (
-            <input
-              key={sp}
-              value={speakerNames[sp] ?? ''}
-              onChange={(e) =>
-                setSpeakerNames((prev) => ({ ...prev, [sp]: e.target.value }))
-              }
-              placeholder={`Speaker ${sp + 1}`}
-              title={`Name for Speaker ${sp + 1}`}
-              className={`w-24 rounded-md border border-white/10 bg-white/5 px-2 py-1 text-[11px] placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none ${INTERVIEWER_COLORS[sp % INTERVIEWER_COLORS.length]}`}
-            />
-          ))}
-        </div>
-      )}
 
       {/* Transcript pane */}
       <div className="no-drag mx-3 mb-2 flex-1 overflow-hidden rounded-xl border border-white/10 bg-black/30">
@@ -1325,6 +1462,64 @@ export default function OverlayView({
         <span className="mr-3">Ctrl+Shift+\ click-through</span>
         <span>Ctrl+Shift+H hide</span>
       </div>
+
+      {/* Minutes of Meeting modal */}
+      {minutesOpen && (
+        <div className="no-drag fixed inset-0 z-50 flex flex-col bg-zinc-950/95 backdrop-blur">
+          <div className="drag flex items-center justify-between border-b border-white/10 px-4 py-2.5">
+            <span className="text-sm font-semibold text-amber-200">Minutes of Meeting</span>
+            <div className="no-drag flex items-center gap-1.5">
+              {streaming && intentRef.current === 'minutes' ? (
+                <button
+                  onClick={cancelAi}
+                  className="rounded bg-red-500/80 px-2 py-1 text-[11px] font-semibold text-white hover:bg-red-500"
+                >
+                  Stop
+                </button>
+              ) : (
+                <>
+                  <button
+                    onClick={copyMinutes}
+                    disabled={!minutes}
+                    className="rounded bg-white/10 px-2 py-1 text-[11px] font-medium text-zinc-100 hover:bg-white/20 disabled:opacity-40"
+                  >
+                    {minutesCopied ? 'Copied' : 'Copy'}
+                  </button>
+                  <button
+                    onClick={generateMinutes}
+                    disabled={finals.length === 0}
+                    className="rounded bg-amber-500/90 px-2 py-1 text-[11px] font-semibold text-white hover:bg-amber-400 disabled:opacity-40"
+                  >
+                    Regenerate
+                  </button>
+                </>
+              )}
+              <button
+                onClick={() => setMinutesOpen(false)}
+                className="rounded px-2 py-1 text-[11px] text-zinc-400 hover:bg-white/10 hover:text-zinc-100"
+              >
+                Close
+              </button>
+            </div>
+          </div>
+          <div className="flex-1 overflow-y-auto px-5 py-4 text-sm leading-relaxed text-zinc-100">
+            {minutesError ? (
+              <span className="text-red-300">{minutesError}</span>
+            ) : minutes ? (
+              <div>
+                <Markdown>{minutes}</Markdown>
+                {streaming && intentRef.current === 'minutes' && (
+                  <span className="ml-0.5 animate-pulse text-amber-300">▍</span>
+                )}
+              </div>
+            ) : streaming && intentRef.current === 'minutes' ? (
+              <span className="text-zinc-500">Generating minutes from the meeting…</span>
+            ) : (
+              <span className="text-zinc-500">No minutes yet.</span>
+            )}
+          </div>
+        </div>
+      )}
     </div>
   )
 }

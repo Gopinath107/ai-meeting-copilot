@@ -31,10 +31,10 @@ let reassertingStealth = false
 let aiAbort: AbortController | null = null
 const audioSamples = { system: 0, mic: 0 }
 let audioStatsTimer: ReturnType<typeof setInterval> | null = null
-// Which speech-to-text provider the current session should use.
-//  - 'auto'     : Sarvam primary, Deepgram fallback (best for code-mixed speech)
-//  - 'deepgram' : force Deepgram (English accuracy + Speaker 1..N labels)
-//  - 'sarvam'   : force Sarvam (best Indian/code-mixed accuracy, no labels)
+// Capture/transcription sample rate. 48 kHz (full wideband) gives the speech
+// engines far more acoustic detail than 16 kHz, markedly improving word accuracy
+// for clean audio. Must match the renderer's AudioCapture rate.
+const SAMPLE_RATE = 48000
 type AsrProvider = 'auto' | 'deepgram' | 'sarvam'
 let asrProvider: AsrProvider = 'auto'
 // Domain terms (tech stack / product names) to bias Deepgram recognition toward
@@ -205,6 +205,7 @@ function startDeepgram(
   asrStreams[kind]?.close()
   const stream = new DeepgramStream({
     apiKey,
+    sampleRate: SAMPLE_RATE,
     keyterms: asrKeyterms,
     allowInsecureTls: getSettings().allowInsecureTls,
     onOpen: () => sendTranscriptStatus(source, 'connected', 'Deepgram'),
@@ -254,6 +255,7 @@ function startSarvam(
   }
   const stream = new SarvamStream({
     apiKey: sarvamApiKey,
+    sampleRate: SAMPLE_RATE,
     // Code-mixed meetings (Indian languages + English in one sentence): let
     // Sarvam auto-detect and transcribe the mixed speech instead of forcing
     // English-only. Interview mode stays 'en-IN' (English, Indian accent).
@@ -297,10 +299,13 @@ function startAsr(kind: 'system' | 'mic', source: 'interviewer' | 'you'): void {
     }
     return
   }
-  // Force Sarvam for best accuracy on Indian / code-mixed speech (no labels).
+  // Force Sarvam for best accuracy on Indian-accented English (no labels). Use
+  // en-IN, not auto-detect: fixing the language to English is markedly more
+  // accurate than 'unknown', which can flip to Hindi/other-language phonetics
+  // and garble English words.
   if (asrProvider === 'sarvam') {
     if (s.sarvamApiKey) {
-      startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, true)
+      startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, false)
     } else if (s.deepgramApiKey) {
       startDeepgram(kind, source, s.deepgramApiKey)
     } else {
@@ -308,9 +313,9 @@ function startAsr(kind: 'system' | 'mic', source: 'interviewer' | 'you'): void {
     }
     return
   }
-  // 'auto': Sarvam primary (with code-mixed detection), Deepgram fallback.
+  // 'auto': Sarvam primary (English en-IN for accuracy), Deepgram fallback.
   if (s.sarvamApiKey) {
-    startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, true)
+    startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, false)
   } else if (s.deepgramApiKey) {
     startDeepgram(kind, source, s.deepgramApiKey)
   } else {
@@ -386,8 +391,8 @@ function setupAudio(): void {
     if (audioStatsTimer) clearInterval(audioStatsTimer)
     audioStatsTimer = setInterval(() => {
       overlayWindow?.webContents.send('audio:stats', {
-        system: audioSamples.system / 16000,
-        mic: audioSamples.mic / 16000
+        system: audioSamples.system / SAMPLE_RATE,
+        mic: audioSamples.mic / SAMPLE_RATE
       })
     }, 1000)
 

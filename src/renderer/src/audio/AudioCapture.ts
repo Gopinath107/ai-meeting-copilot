@@ -8,7 +8,12 @@ export type AudioCaptureHandlers = {
   onError: (kind: AudioSourceKind, error: Error) => void
 }
 
-const TARGET_SAMPLE_RATE = 16000
+// Capture at 48 kHz (full wideband) rather than 16 kHz. The extra bandwidth
+// keeps the high-frequency detail of consonants (s/f/th/t), which is exactly
+// what speech engines need to tell similar-sounding words apart — a big
+// accuracy win over downsampled 16 kHz. Most hardware runs at 48 kHz natively,
+// so this usually avoids any resampling too.
+const TARGET_SAMPLE_RATE = 48000
 
 function computeRms(pcm: Int16Array): number {
   if (pcm.length === 0) return 0
