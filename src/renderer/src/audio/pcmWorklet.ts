@@ -1,4 +1,4 @@
-// AudioWorklet processor that emits 48 kHz mono Int16 PCM in ~100 ms chunks.
+// AudioWorklet processor that emits 16 kHz mono Int16 PCM in ~100 ms chunks.
 // Loaded into the AudioWorklet thread via a Blob URL (see AudioCapture.ts), so it
 // must be plain, self-contained classic-script JS with no imports.
 export const pcmWorkletSource = `
@@ -6,7 +6,7 @@ class PCMProcessor extends AudioWorkletProcessor {
   constructor() {
     super()
     this._buffer = []
-    this._chunkSize = 4800 // ~100ms at 48 kHz
+    this._chunkSize = 1600 // ~100ms at 16 kHz
   }
 
   process(inputs) {

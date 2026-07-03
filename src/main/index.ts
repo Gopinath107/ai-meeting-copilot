@@ -31,10 +31,12 @@ let reassertingStealth = false
 let aiAbort: AbortController | null = null
 const audioSamples = { system: 0, mic: 0 }
 let audioStatsTimer: ReturnType<typeof setInterval> | null = null
-// Capture/transcription sample rate. 48 kHz (full wideband) gives the speech
-// engines far more acoustic detail than 16 kHz, markedly improving word accuracy
-// for clean audio. Must match the renderer's AudioCapture rate.
-const SAMPLE_RATE = 48000
+// Capture/transcription sample rate. Must be 16 kHz: Sarvam's streaming STT (the
+// primary provider for the interviewer/system audio) only accepts 16 kHz PCM —
+// sending 48 kHz makes it reject the stream or mis-decode the audio (garbled
+// text). Deepgram works fine at 16 kHz too. Must match the renderer's
+// AudioCapture rate.
+const SAMPLE_RATE = 16000
 type AsrProvider = 'auto' | 'deepgram' | 'sarvam'
 let asrProvider: AsrProvider = 'auto'
 // Domain terms (tech stack / product names) to bias Deepgram recognition toward

@@ -111,9 +111,16 @@ export class DeepgramStream {
       // Format spoken numbers as digits ("twenty twenty five" -> "2025") so
       // versions, ports, quantities and dates in the transcript are accurate.
       numerals: 'true',
-      // Give a slightly longer silence gap before finalising so full sentences
-      // aren't chopped mid-thought (helps accuracy of multi-speaker meetings).
-      endpointing: '400'
+      // Finalise ~250 ms after the speaker pauses. Lower = the transcript text
+      // appears much sooner after they stop talking (was 400 ms, which felt
+      // laggy); still long enough that normal in-sentence pauses don't chop a
+      // sentence into fragments.
+      endpointing: '250',
+      // Emit an UtteranceEnd event from word timings even when audio never goes
+      // fully silent (e.g. background noise on a call), so finals aren't held
+      // back waiting for a silence gap that never comes — a common cause of
+      // "it delays before showing the text". Requires interim_results (set above).
+      utterance_end_ms: '1000'
     })
     // Keyterm Prompting is a nova-3 English-only feature. Feed the meeting's
     // tech stack / product terms so domain jargon is recognised accurately.

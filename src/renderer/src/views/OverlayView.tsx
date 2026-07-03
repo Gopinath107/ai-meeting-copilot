@@ -990,7 +990,13 @@ export default function OverlayView({
         }
         setFinals((prev) => [...prev, { source, text, speaker }])
         setInterim((prev) => ({ ...prev, [source]: '' }))
-      } else if (heardVoice || highConfidence) {
+      } else if (heardVoice || conf !== undefined) {
+        // Live preview (interim). Deepgram sends a confidence with every partial
+        // (conf !== undefined), and its own professional VAD already decided this
+        // is speech — so show its partials immediately instead of waiting for our
+        // crude RMS meter to catch up. That removes the "it delays before showing
+        // the text" lag. This is safe: the FINAL result is still fully validated
+        // by the gates above, and a dropped/rejected final clears this preview.
         setInterim((prev) => ({ ...prev, [source]: text }))
       }
     })

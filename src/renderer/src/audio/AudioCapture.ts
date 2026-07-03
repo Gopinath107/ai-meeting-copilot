@@ -8,12 +8,11 @@ export type AudioCaptureHandlers = {
   onError: (kind: AudioSourceKind, error: Error) => void
 }
 
-// Capture at 48 kHz (full wideband) rather than 16 kHz. The extra bandwidth
-// keeps the high-frequency detail of consonants (s/f/th/t), which is exactly
-// what speech engines need to tell similar-sounding words apart — a big
-// accuracy win over downsampled 16 kHz. Most hardware runs at 48 kHz natively,
-// so this usually avoids any resampling too.
-const TARGET_SAMPLE_RATE = 48000
+// Capture at 16 kHz mono. This is the rate Sarvam's streaming STT (our primary
+// provider) requires; Deepgram accepts it too. Sending 48 kHz broke Sarvam
+// (stream stops / garbled text), so keep both capture and the declared
+// sample_rate at 16 kHz.
+const TARGET_SAMPLE_RATE = 16000
 
 function computeRms(pcm: Int16Array): number {
   if (pcm.length === 0) return 0
