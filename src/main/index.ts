@@ -10,7 +10,8 @@ import {
   nativeImage,
   Tray,
   Menu,
-  dialog
+  dialog,
+  clipboard
 } from 'electron'
 import { join, extname, basename } from 'path'
 import { readFile } from 'fs/promises'
@@ -537,6 +538,19 @@ app.whenReady().then(() => {
     }
     const cap = kind === 'resume' ? 8000 : 5000
     return { names, text: parts.join('\n\n---\n\n').slice(0, cap) }
+  })
+
+  // Reliable copy-to-clipboard from the renderer. The web Clipboard API can fail
+  // silently in a transparent, always-on-top, often-unfocused overlay window, so
+  // we write through Electron's main-process clipboard instead.
+  ipcMain.handle('clipboard:write', (_event, text: string) => {
+    try {
+      clipboard.writeText(typeof text === 'string' ? text : String(text))
+      return true
+    } catch (error) {
+      console.error('clipboard write failed:', error)
+      return false
+    }
   })
 
   setupAudio()

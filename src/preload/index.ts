@@ -40,6 +40,7 @@ const api = {
     ipcRenderer.invoke('settings:save', input),
   pickDocument: (kind: 'resume' | 'extra'): Promise<PickedDocs | null> =>
     ipcRenderer.invoke('docs:pick', kind),
+  copyText: (text: string): Promise<boolean> => ipcRenderer.invoke('clipboard:write', text),
   hide: (): void => ipcRenderer.send('window:hide'),
   quit: (): void => ipcRenderer.send('window:quit'),
   setClickThrough: (value: boolean): void => ipcRenderer.send('window:setClickThrough', value),

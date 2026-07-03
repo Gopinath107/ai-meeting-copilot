@@ -529,27 +529,27 @@ export default function OverlayView({
     const docs = config?.docsText?.trim()
     const name = config?.userName?.trim()
     return [
-      'You are a principal software engineer and solution architect with 20-30 years of hands-on experience, silently assisting me during a live team meeting.',
-      'Several participants (labelled Speaker 1, Speaker 2, ... in the transcript) are discussing an application and its features (for example a login page, an API, a data model).',
+      'You are a sharp, highly experienced professional with 20+ years in the room, silently assisting me during a live meeting. The meeting may be about ANYTHING — business, project planning, product, operations, finance, HR, strategy, or a general discussion — NOT necessarily technical. Adapt to whatever the topic actually is; do not force a technical framing.',
+      'Several participants (labelled Speaker 1, Speaker 2, ... or by name in the transcript) are talking. Follow the conversation and help me contribute like a seasoned expert.',
       'Two request types will come to you — obey the one named in the user message:',
       '',
-      '[ANALYZE] Evaluate the ongoing discussion at a senior/architect level. Respond ONLY with this compact Markdown structure, omitting any section that has nothing substantive to add:',
-      '**Topic:** the specific feature/area under discussion (one line).',
-      '**Assessment:** is what they are saying technically correct and sound? Explicitly confirm what is right and flag what is wrong, risky, or imprecise.',
-      '**Corrections:** the correct approach for anything that was wrong — precise and actionable.',
-      '**Suggestions:** best practices, trade-offs, edge cases, security/scalability/maintainability concerns they are missing.',
-      '**Follow-ups:** 2-3 sharp questions that move the discussion forward or expose gaps.',
-      'Keep it tight and skimmable — short bullets, **bold** key terms, correct terminology. No filler, no restating the transcript.',
+      '[ANALYZE] Give me a quick, senior-level read on what is being discussed so I can follow and contribute. Respond ONLY with this compact Markdown structure, omitting any section with nothing useful to add:',
+      '**Topic:** what is being discussed right now (one line).',
+      '**Key points:** 2-4 short bullets capturing what actually matters from the latest discussion.',
+      '**My input:** 1-3 bullets of what I could say or contribute right now — practical, relevant, adds value.',
+      '**Watch-outs:** anything being missed, a risk, or a wrong assumption (only if there is one).',
+      '**Follow-ups:** 1-2 sharp questions I could ask to move things forward (only if useful).',
+      'Keep it tight and skimmable — short bullets, **bold** key terms. No filler, no restating the transcript.',
       '',
-      '[ANSWER] A question has been directed at me. Answer in the FIRST PERSON as me, in a clear, confident, senior voice, ready to say out loud. Lead with the direct answer, then 2-4 crisp supporting points. Use short "-" bullets for multi-part answers and fenced code blocks (with a language tag) for any code, commands, JSON, or SQL. Be precise and pragmatic, mention the key trade-off, and stay concise.',
+      '[ANSWER] Something was asked or directed at me. Answer in the FIRST PERSON as me, ready to say out loud, the way a calm, confident person with 20 years of experience would speak. Lead with the direct answer in one or two sentences, then at most 2-4 crisp supporting points as short "-" bullets if needed. Keep it SHORT and natural — spoken, not an essay. Get to the point, sound composed and credible, and stop. Only include code/commands/numbers if the topic is actually technical and they are needed.',
       '',
-      'The transcript is machine-generated (speech-to-text) and WILL contain recognition errors, especially for technical terms and product names. Silently reconstruct the intended meaning before responding: interpret garbled words against the tech stack and project context below (for example "ring board" or "sprint boot" almost certainly means "Spring Boot"; "power gres" means "PostgreSQL"; "jason" means "JSON"; "cuber netties" means "Kubernetes"). Always reason about the speaker\'s INTENT, not the literal mis-transcribed words, and use the correct canonical term in your reply. If a word is truly ambiguous, pick the most likely meaning given the tech stack and proceed.',
+      'The transcript is machine-generated (speech-to-text) and WILL contain recognition errors, especially for names, jargon, and product terms. Silently reconstruct the intended meaning before responding — reason about the speaker\'s INTENT, not the literal mis-transcribed words. If a word is truly ambiguous, pick the most likely meaning from context and proceed.',
       '',
-      'Rules for both: Never fabricate facts, numbers, names, APIs, or library behaviour — use only real, standard, documented technology, and if unsure say so or use a well-known correct alternative. Prefer precision over sounding impressive. Ground everything in the project context below.',
+      'Rules for both: Be concise above all — never pad. Never fabricate facts, numbers, names, dates, or details; if you do not know, speak in general terms rather than inventing specifics. Match the tone and domain of the actual meeting. Prefer sounding clear and experienced over sounding impressive.',
       name ? `My name: ${name}.` : '',
       role ? `My role: ${role}.` : '',
-      project ? `Project / application context:\n${project}` : '',
-      stack ? `Tech stack: ${stack}.` : '',
+      project ? `Meeting / project context:\n${project}` : '',
+      stack ? `Relevant background (tech stack or domain, if applicable): ${stack}.` : '',
       docs ? `Reference docs:\n${docs}` : ''
     ]
       .filter(Boolean)
@@ -690,7 +690,9 @@ export default function OverlayView({
     // Supersede any in-flight request so a new question is never blocked.
     if (streamingRef.current) window.api.aiCancel()
     intentRef.current = 'answer'
-    setActiveTab('answer')
+    // Note: we do NOT switch the active tab here. Auto-answer fires on every
+    // question, and force-switching kept yanking you between Answer/Analysis.
+    // The tab only changes when YOU click Answer / press the hotkey.
     // Keep the previous answer on screen: move it into history instead of wiping
     // it, so a new answer never erases what you're still reading.
     const prev = answerAccRef.current.trim()
@@ -717,7 +719,10 @@ export default function OverlayView({
   function streamAnalysis(user: string): void {
     if (streamingRef.current) window.api.aiCancel()
     intentRef.current = 'analyze'
-    setActiveTab('analysis')
+    // Note: we do NOT force the active tab to 'analysis' here. Auto-analysis runs
+    // continuously, and force-switching kept yanking the user off the Answer tab
+    // so generated answers were never seen. Manual "Analyse" switches the tab
+    // itself (see analyzeDiscussion caller); auto-analysis updates silently.
     // Keep the previous analysis on screen: move it into history instead of
     // wiping it, so continuous auto-analysis never erases what you're reading.
     const prev = analysisAccRef.current.trim()
@@ -793,10 +798,13 @@ export default function OverlayView({
     }
   }
 
-  function askAi(): void {
+  function askAi(switchTab = false): void {
     if (finalsRef.current.length === 0) return
     const question = latestQuestion()
     if (!question) return
+    // Only a manual Answer action moves you to the Answer tab; auto-answer leaves
+    // your current tab alone.
+    if (switchTab) setActiveTab('answer')
     // Mark this turn as answered so the next auto-answer only picks up questions
     // asked AFTER this point (prevents re-answering the same/previous question).
     lastAnsweredCountRef.current = finalsRef.current.length
@@ -818,6 +826,8 @@ export default function OverlayView({
   function askManual(): void {
     const q = manualQuestion.trim()
     if (!q) return
+    // Manual ask: this is a deliberate user action, so show the Answer tab.
+    setActiveTab('answer')
     // A manual ask handles the current moment, so don't let the auto-answer
     // re-fire on the same transcript question right after.
     lastAnsweredCountRef.current = finalsRef.current.length
@@ -908,12 +918,25 @@ export default function OverlayView({
   async function copyMinutes(): Promise<void> {
     const text = minutesAccRef.current || minutes
     if (!text) return
+    // Prefer Electron's main-process clipboard (reliable in an unfocused overlay);
+    // fall back to the web Clipboard API if for some reason it's unavailable.
+    let ok = false
     try {
-      await navigator.clipboard.writeText(text)
+      ok = await window.api.copyText(text)
+    } catch {
+      ok = false
+    }
+    if (!ok) {
+      try {
+        await navigator.clipboard.writeText(text)
+        ok = true
+      } catch {
+        ok = false
+      }
+    }
+    if (ok) {
       setMinutesCopied(true)
       setTimeout(() => setMinutesCopied(false), 1500)
-    } catch {
-      // Clipboard may be unavailable; ignore silently.
     }
   }
 
@@ -1022,9 +1045,15 @@ export default function OverlayView({
 
     if (isMeeting) {
       // Meeting mode runs off two independent toggles, so don't early-return on
-      // autoAnswer. Track whether this turn was aimed at me, then either draft an
-      // answer (aimed at me) or analyse the discussion.
-      if (isDirectedAtMe(last.text, config?.userName)) turnDirectedRef.current = true
+      // autoAnswer. Track whether this turn should be ANSWERED (draft a reply for
+      // me to say) vs just analysed. We answer when auto-answer is on and either
+      // the utterance is clearly aimed at me (my name / "what do you think")
+      // OR it simply looks like a question — otherwise most normal questions were
+      // never being answered and everything fell through to analysis only.
+      const directed =
+        autoAnswerRef.current &&
+        (isDirectedAtMe(last.text, config?.userName) || looksLikeQuestion(last.text))
+      if (directed) turnDirectedRef.current = true
       // Debounce: (re)arm the "they've stopped talking" pause timer. Use a
       // shorter wait when a question is aimed at me so I get an answer faster.
       if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
@@ -1295,7 +1324,7 @@ export default function OverlayView({
 
   useEffect(() => {
     const off = window.api.onHotkey((payload) => {
-      if (payload.action === 'ask') askAi()
+      if (payload.action === 'ask') askAi(true)
     })
     return off
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1540,14 +1569,17 @@ export default function OverlayView({
                 </button>
               ) : activeTab === 'analysis' ? (
                 <button
-                  onClick={analyzeDiscussion}
+                  onClick={() => {
+                    setActiveTab('analysis')
+                    analyzeDiscussion()
+                  }}
                   className="rounded bg-emerald-500/90 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-emerald-400"
                 >
                   Analyse
                 </button>
               ) : (
                 <button
-                  onClick={askAi}
+                  onClick={() => askAi(true)}
                   className="rounded bg-indigo-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-indigo-400"
                 >
                   Answer
@@ -1646,7 +1678,7 @@ export default function OverlayView({
                 </button>
               ) : (
                 <button
-                  onClick={askAi}
+                  onClick={() => askAi(true)}
                   className="rounded bg-indigo-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-indigo-400"
                 >
                   Answer
