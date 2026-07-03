@@ -351,6 +351,9 @@ export default function OverlayView({
   })
   const [dgStatus, setDgStatus] = useState<string>('')
   const [suggestion, setSuggestion] = useState<string>('')
+  // Completed past answers, kept on screen so a new response never wipes what
+  // you're still reading. New answers append below these; the Clear button empties them.
+  const [answerHistory, setAnswerHistory] = useState<string[]>([])
   const [streaming, setStreaming] = useState(false)
   const [aiError, setAiError] = useState<string | null>(null)
   const [autoAnswer, setAutoAnswer] = useState(true)
@@ -379,6 +382,8 @@ export default function OverlayView({
   type Provider = 'auto' | 'deepgram' | 'sarvam'
   const [provider, setProvider] = useState<Provider>('deepgram')
   const [analysis, setAnalysis] = useState('')
+  // Completed past analyses, kept on screen (same reasoning as answerHistory).
+  const [analysisHistory, setAnalysisHistory] = useState<string[]>([])
   const [autoAnalyze, setAutoAnalyze] = useState(isMeeting)
   const [activeTab, setActiveTab] = useState<'analysis' | 'answer'>(
     isMeeting ? 'analysis' : 'answer'
@@ -686,6 +691,10 @@ export default function OverlayView({
     if (streamingRef.current) window.api.aiCancel()
     intentRef.current = 'answer'
     setActiveTab('answer')
+    // Keep the previous answer on screen: move it into history instead of wiping
+    // it, so a new answer never erases what you're still reading.
+    const prev = answerAccRef.current.trim()
+    if (prev) setAnswerHistory((h) => [...h, prev].slice(-30))
     setSuggestion('')
     setAiError(null)
     setStreaming(true)
@@ -709,6 +718,10 @@ export default function OverlayView({
     if (streamingRef.current) window.api.aiCancel()
     intentRef.current = 'analyze'
     setActiveTab('analysis')
+    // Keep the previous analysis on screen: move it into history instead of
+    // wiping it, so continuous auto-analysis never erases what you're reading.
+    const prev = analysisAccRef.current.trim()
+    if (prev) setAnalysisHistory((h) => [...h, prev].slice(-30))
     setAnalysis('')
     setAiError(null)
     setStreaming(true)
@@ -721,6 +734,19 @@ export default function OverlayView({
       { role: 'system', content: buildSystemPrompt() },
       { role: 'user', content: user }
     ])
+  }
+
+  // Manual "Clear" for the answer / analysis panes — the only thing that empties
+  // them now (new responses append instead of wiping).
+  function clearAnswers(): void {
+    setAnswerHistory([])
+    setSuggestion('')
+    answerAccRef.current = ''
+  }
+  function clearAnalyses(): void {
+    setAnalysisHistory([])
+    setAnalysis('')
+    analysisAccRef.current = ''
   }
 
   function analyzeDiscussion(): void {
@@ -1213,6 +1239,8 @@ export default function OverlayView({
     setInterim({ interviewer: '', you: '' })
     setDgStatus('')
     setSpeakerNames({})
+    setAnswerHistory([])
+    setAnalysisHistory([])
     lastAnalyzedCountRef.current = 0
     lastAnsweredCountRef.current = 0
     hasProvisionalRef.current = { interviewer: false, you: false }
@@ -1525,17 +1553,38 @@ export default function OverlayView({
                   Answer
                 </button>
               )}
+              <button
+                onClick={activeTab === 'analysis' ? clearAnalyses : clearAnswers}
+                title={`Clear the ${activeTab === 'analysis' ? 'analysis' : 'answer'} history`}
+                disabled={
+                  activeTab === 'analysis'
+                    ? analysisHistory.length === 0 && !analysis
+                    : answerHistory.length === 0 && !suggestion
+                }
+                className="rounded bg-white/5 px-2 py-0.5 text-[10px] font-semibold text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+              >
+                Clear
+              </button>
             </div>
           </div>
           <div className="flex-1 overflow-y-auto px-3 py-2 text-sm leading-relaxed text-zinc-100">
             {aiError ? (
               <span className="text-red-300">{aiError}</span>
             ) : activeTab === 'analysis' ? (
-              analysis ? (
+              analysisHistory.length > 0 || analysis ? (
                 <div>
-                  <Markdown>{analysis}</Markdown>
-                  {streaming && intentRef.current === 'analyze' && (
-                    <span className="ml-0.5 animate-pulse text-emerald-300">▍</span>
+                  {analysisHistory.map((a, i) => (
+                    <div key={i} className="mb-3 border-b border-white/10 pb-3 opacity-80">
+                      <Markdown>{a}</Markdown>
+                    </div>
+                  ))}
+                  {analysis && (
+                    <div>
+                      <Markdown>{analysis}</Markdown>
+                      {streaming && intentRef.current === 'analyze' && (
+                        <span className="ml-0.5 animate-pulse text-emerald-300">▍</span>
+                      )}
+                    </div>
                   )}
                 </div>
               ) : streaming && intentRef.current === 'analyze' ? (
@@ -1546,11 +1595,20 @@ export default function OverlayView({
                   smart follow-up questions.
                 </span>
               )
-            ) : suggestion ? (
+            ) : answerHistory.length > 0 || suggestion ? (
               <div>
-                <Markdown>{suggestion}</Markdown>
-                {streaming && intentRef.current === 'answer' && (
-                  <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>
+                {answerHistory.map((a, i) => (
+                  <div key={i} className="mb-3 border-b border-white/10 pb-3 opacity-80">
+                    <Markdown>{a}</Markdown>
+                  </div>
+                ))}
+                {suggestion && (
+                  <div>
+                    <Markdown>{suggestion}</Markdown>
+                    {streaming && intentRef.current === 'answer' && (
+                      <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>
+                    )}
+                  </div>
                 )}
               </div>
             ) : streaming && intentRef.current === 'answer' ? (
@@ -1594,15 +1652,32 @@ export default function OverlayView({
                   Answer
                 </button>
               )}
+              <button
+                onClick={clearAnswers}
+                title="Clear the answer history"
+                disabled={answerHistory.length === 0 && !suggestion}
+                className="rounded bg-white/5 px-2 py-0.5 text-[10px] font-semibold text-zinc-300 hover:bg-white/10 disabled:opacity-30"
+              >
+                Clear
+              </button>
             </div>
           </div>
           <div className="flex-1 overflow-y-auto px-3 py-2 text-sm leading-relaxed text-zinc-100">
             {aiError ? (
               <span className="text-red-300">{aiError}</span>
-            ) : suggestion ? (
+            ) : answerHistory.length > 0 || suggestion ? (
               <div>
-                <Markdown>{suggestion}</Markdown>
-                {streaming && <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>}
+                {answerHistory.map((a, i) => (
+                  <div key={i} className="mb-3 border-b border-white/10 pb-3 opacity-80">
+                    <Markdown>{a}</Markdown>
+                  </div>
+                ))}
+                {suggestion && (
+                  <div>
+                    <Markdown>{suggestion}</Markdown>
+                    {streaming && <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>}
+                  </div>
+                )}
               </div>
             ) : streaming ? (
               <span className="text-zinc-500">Generating…</span>
