@@ -120,6 +120,12 @@ const SPEECH_FLOOR_MULT = 3
 // > 0.7; hallucinations over silence/noise score low. Drop finals below this.
 // (Sarvam sends no confidence, so its finals are undefined and skip this check.)
 const MIN_CONFIDENCE = 0.6
+// When Deepgram is this confident, trust its OWN professional voice-activity
+// detection completely and accept the words even if our crude RMS meter didn't
+// register the energy spike (timing lag). This stops us discarding correct,
+// high-confidence speech — the single biggest cause of "missing/inaccurate"
+// lines for clean audio.
+const HIGH_CONFIDENCE = 0.8
 
 // --- Meeting auto-response timing -------------------------------------------
 // Meeting mode fires the AI on a natural pause (debounce), but during a fast
@@ -958,21 +964,33 @@ export default function OverlayView({
       // Voice-activity gate: if no speech-level audio energy occurred on this
       // source recently, the model invented this text over silence — ignore it.
       const heardVoice = Date.now() - vadRef.current[kind].lastVoiceTs <= voiceWindow
-      // Confidence gate: Deepgram reports how sure it is (0-1). Low-confidence
-      // finals are almost always hallucinations over silence/noise — drop them.
-      const lowConfidence = typeof confidence === 'number' && confidence < MIN_CONFIDENCE
+      // Deepgram's per-utterance confidence (0-1). High = trust its own VAD.
+      const conf = typeof confidence === 'number' ? confidence : undefined
+      const highConfidence = conf !== undefined && conf >= HIGH_CONFIDENCE
+      const lowConfidence = conf !== undefined && conf < MIN_CONFIDENCE
       if (isFinal) {
-        // Drop hallucinated filler so it neither clutters the transcript nor
-        // triggers a phantom auto-answer when nobody is really speaking.
-        if (!heardVoice || lowConfidence || isNoise(text)) {
-          if (!heardVoice) console.debug('[vad] dropped silent hallucination:', text)
-          if (lowConfidence) console.debug('[conf] dropped low-confidence text:', confidence, text)
+        // Known hallucination phrases ("thanks for watching", lone "you", etc.)
+        // are always dropped — safe regardless of how the engine scored them.
+        if (isNoise(text)) {
           setInterim((prev) => ({ ...prev, [source]: '' }))
           return
         }
+        // Trust a high-confidence Deepgram result outright: its professional VAD
+        // already validated real speech, so accept even if our crude RMS meter
+        // missed the energy (prevents discarding correct words).
+        if (!highConfidence) {
+          // Otherwise fall back to our gates: drop if no real audio energy was
+          // heard, or the engine itself was not confident.
+          if (!heardVoice || lowConfidence) {
+            if (!heardVoice) console.debug('[vad] dropped silent hallucination:', text)
+            if (lowConfidence) console.debug('[conf] dropped low-confidence text:', conf, text)
+            setInterim((prev) => ({ ...prev, [source]: '' }))
+            return
+          }
+        }
         setFinals((prev) => [...prev, { source, text, speaker }])
         setInterim((prev) => ({ ...prev, [source]: '' }))
-      } else if (heardVoice) {
+      } else if (heardVoice || highConfidence) {
         setInterim((prev) => ({ ...prev, [source]: text }))
       }
     })
