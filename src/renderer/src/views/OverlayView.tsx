@@ -117,15 +117,10 @@ const SARVAM_VOICE_WINDOW_MS = 6000
 const SPEECH_RMS_MIN = 0.012
 const SPEECH_FLOOR_MULT = 3
 // Deepgram gives a per-utterance confidence (0-1). Real speech is typically
-// > 0.7; hallucinations over silence/noise score low. Drop finals below this.
+// > 0.6; only clearly low-confidence guesses (< this) are dropped so we keep
+// correct-but-borderline words instead of losing them (accuracy over caution).
 // (Sarvam sends no confidence, so its finals are undefined and skip this check.)
-const MIN_CONFIDENCE = 0.6
-// When Deepgram is this confident, trust its OWN professional voice-activity
-// detection completely and accept the words even if our crude RMS meter didn't
-// register the energy spike (timing lag). This stops us discarding correct,
-// high-confidence speech — the single biggest cause of "missing/inaccurate"
-// lines for clean audio.
-const HIGH_CONFIDENCE = 0.8
+const MIN_CONFIDENCE = 0.45
 // When people talk non-stop (e.g. two speakers overlapping), Deepgram never sees
 // the silence it needs to finalise, so the live preview would sit there growing
 // and never commit — it "waits for silence". If a preview keeps growing this long
@@ -976,7 +971,7 @@ export default function OverlayView({
       // One answer per turn; never cut off an answer that's already streaming.
       if (!ask || !autoAnswerRef.current || streamingRef.current) return
       askAi()
-    }, 1600)
+    }, AUTO_SILENCE_MS)
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finals])
 
@@ -1012,14 +1007,20 @@ export default function OverlayView({
       const heardVoice = Date.now() - vadRef.current[kind].lastVoiceTs <= voiceWindow
       // Deepgram's per-utterance confidence (0-1). High = trust its own VAD.
       const conf = typeof confidence === 'number' ? confidence : undefined
-      const highConfidence = conf !== undefined && conf >= HIGH_CONFIDENCE
       const lowConfidence = conf !== undefined && conf < MIN_CONFIDENCE
       if (isFinal) {
         // A final ends the current utterance, so cancel any pending promote timer.
         clearPromote(source)
-        // Drop known hallucinations, and (unless Deepgram is very confident)
-        // anything with no real audio energy or low engine confidence.
-        const isBad = isNoise(text) || (!highConfidence && (!heardVoice || lowConfidence))
+        // Decide whether to keep this finalised line.
+        //  - Deepgram (has a confidence): TRUST its professional VAD + confidence.
+        //    Drop only obvious hallucination phrases (isNoise) or genuinely
+        //    low-confidence guesses. We deliberately do NOT require our crude RMS
+        //    energy meter here: on system/loopback audio it often under-reads and
+        //    was silently dropping correct medium-confidence words — the main
+        //    cause of the "accuracy is too low / words missing" problem.
+        //  - Sarvam (no confidence): fall back to the RMS voice window to reject
+        //    text invented over true silence.
+        const isBad = isNoise(text) || (conf !== undefined ? lowConfidence : !heardVoice)
         if (isBad) {
           if (!isNoise(text) && !heardVoice)
             console.debug('[vad] dropped silent hallucination:', text)
