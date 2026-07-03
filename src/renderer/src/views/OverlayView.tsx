@@ -396,6 +396,11 @@ export default function OverlayView({
   const minutesAccRef = useRef('')
   const autoAnalyzeRef = useRef(autoAnalyze)
   const lastAnalyzedCountRef = useRef(0)
+  // How many transcript lines had been produced the last time we answered a
+  // question. Interviewer lines AFTER this point are the current, unanswered
+  // question — so we never re-answer a question from an earlier turn (the mic is
+  // off, so old and new questions aren't separated by a "Me:" line).
+  const lastAnsweredCountRef = useRef(0)
   useEffect(() => {
     autoAnalyzeRef.current = autoAnalyze
   }, [autoAnalyze])
@@ -560,6 +565,32 @@ export default function OverlayView({
       .join('\n')
   }
 
+  // The single most recent thing the OTHER side said — i.e. the actual question
+  // to answer right now. We only want to answer THIS, using earlier lines as
+  // context, so the AI stops re-answering previous questions. We take the
+  // interviewer/speaker lines that appeared since our last answer (the current
+  // unanswered turn), joined so a question split across a couple of finals stays
+  // whole.
+  function latestQuestion(): string {
+    const finals = finalsRef.current
+    const start = Math.min(lastAnsweredCountRef.current, finals.length)
+    const turn: string[] = []
+    // Walk back from the end, collecting the trailing run of interviewer lines,
+    // but never earlier than the point we last answered.
+    for (let i = finals.length - 1; i >= start; i--) {
+      if (finals[i].source !== 'interviewer') break
+      turn.unshift(finals[i].text)
+    }
+    // Fallback: if nothing new is attributable (e.g. everything got merged), use
+    // the last interviewer line so we still answer something current.
+    if (turn.length === 0) {
+      for (let i = finals.length - 1; i >= 0; i--) {
+        if (finals[i].source === 'interviewer') return finals[i].text.trim()
+      }
+    }
+    return turn.join(' ').trim()
+  }
+
   // Recent verbatim lines prefixed with the running summary of everything said
   // earlier, so the AI always has the full history of the meeting — not just the
   // last few sentences — even hours in.
@@ -694,8 +725,15 @@ export default function OverlayView({
 
   function analyzeDiscussion(): void {
     if (finalsRef.current.length === 0) return
+    // Only the lines that are NEW since the last analysis are what we analyse now;
+    // everything before is context. This stops the analysis from re-covering
+    // previous points every time.
+    const newCount = Math.max(1, finalsRef.current.length - lastAnalyzedCountRef.current)
+    const latest = recentTranscript(newCount)
     streamAnalysis(
-      `[ANALYZE] Here is the meeting discussion so far:\n${transcriptWithHistory(16)}\n\nAnalyse the latest discussion now using the ANALYZE format, taking the earlier context into account.`
+      `[ANALYZE] Earlier discussion (context only — already covered, do NOT re-analyse):\n${transcriptWithHistory(16)}\n\n` +
+        `THE LATEST PART TO ANALYSE NOW (new since the last analysis):\n${latest}\n\n` +
+        `Analyse ONLY this latest part using the ANALYZE format. Do not repeat analysis of the earlier context above.`
     )
   }
 
@@ -714,10 +752,16 @@ export default function OverlayView({
     }
     const directed = turnDirectedRef.current
     turnDirectedRef.current = false
-    if (streamingRef.current) return
     if (directed && autoAnswerRef.current) {
+      // A question aimed at me has priority: answer it even if analysis is
+      // currently streaming (streamAnswer cancels the in-flight analysis first).
+      // Previously we bailed out when a stream was busy, so directed questions
+      // were silently dropped while auto-analyse hogged the single AI stream —
+      // that was the "answer is not generating" bug.
       askAi()
     } else if (autoAnalyzeRef.current) {
+      // Analysis is lower priority: don't interrupt an in-flight answer/analysis.
+      if (streamingRef.current) return
       // Only analyse once there is enough fresh discussion to be worth it.
       if (finalsRef.current.length - lastAnalyzedCountRef.current >= 2) analyzeDiscussion()
     }
@@ -725,20 +769,32 @@ export default function OverlayView({
 
   function askAi(): void {
     if (finalsRef.current.length === 0) return
+    const question = latestQuestion()
+    if (!question) return
+    // Mark this turn as answered so the next auto-answer only picks up questions
+    // asked AFTER this point (prevents re-answering the same/previous question).
+    lastAnsweredCountRef.current = finalsRef.current.length
     if (isMeeting) {
       streamAnswer(
-        `[ANSWER] Meeting discussion so far:\n${transcriptWithHistory(14)}\n\nA question has been directed at me. Answer the most recent question aimed at me, in the first person, ready to say out loud. Use the earlier context above if the question refers back to it.`
+        `[ANSWER] Recent meeting discussion (context only — do NOT answer anything here):\n${transcriptWithHistory(14)}\n\n` +
+          `THE QUESTION TO ANSWER NOW (the most recent thing directed at me):\n"${question}"\n\n` +
+          `Answer ONLY this most recent question, in the first person, ready to say out loud. Ignore and do not re-answer any earlier questions — use the discussion above only as background if this question refers back to it.`
       )
       return
     }
     streamAnswer(
-      `Interview transcript so far:\n${transcriptWithHistory(14)}\n\nAnswer the interviewer's most recent question thoroughly. If they asked several questions, address each one.`
+      `Interview transcript (context only — do NOT answer anything here):\n${transcriptWithHistory(14)}\n\n` +
+        `THE QUESTION TO ANSWER NOW (the interviewer's most recent question):\n"${question}"\n\n` +
+        `Answer ONLY this most recent question thoroughly. Do not re-answer earlier questions; use the transcript above only as background if this question refers back to it.`
     )
   }
 
   function askManual(): void {
     const q = manualQuestion.trim()
     if (!q) return
+    // A manual ask handles the current moment, so don't let the auto-answer
+    // re-fire on the same transcript question right after.
+    lastAnsweredCountRef.current = finalsRef.current.length
     const ctx = transcriptWithHistory(8)
     const user = isMeeting
       ? (ctx ? `[ANSWER] Recent meeting discussion (context):\n${ctx}\n\n` : '[ANSWER] ') +
@@ -1158,6 +1214,7 @@ export default function OverlayView({
     setDgStatus('')
     setSpeakerNames({})
     lastAnalyzedCountRef.current = 0
+    lastAnsweredCountRef.current = 0
     hasProvisionalRef.current = { interviewer: false, you: false }
     if (promoteTimerRef.current.interviewer) clearTimeout(promoteTimerRef.current.interviewer)
     if (promoteTimerRef.current.you) clearTimeout(promoteTimerRef.current.you)
