@@ -126,6 +126,13 @@ const MIN_CONFIDENCE = 0.6
 // high-confidence speech — the single biggest cause of "missing/inaccurate"
 // lines for clean audio.
 const HIGH_CONFIDENCE = 0.8
+// When people talk non-stop (e.g. two speakers overlapping), Deepgram never sees
+// the silence it needs to finalise, so the live preview would sit there growing
+// and never commit — it "waits for silence". If a preview keeps growing this long
+// without a final, we promote it to a committed line right away so the transcript
+// keeps moving. Deepgram's real final later replaces that line in place (no
+// duplicate). Keep this short for an "immediate" feel.
+const INTERIM_PROMOTE_MS = 1500
 
 // --- Meeting auto-response timing -------------------------------------------
 // Meeting mode fires the AI on a natural pause (debounce), but during a fast
@@ -341,7 +348,7 @@ export default function OverlayView({
   onBack: () => void
 }) {
   const [finals, setFinals] = useState<
-    { source: TranscriptSource; text: string; speaker?: number }[]
+    { source: TranscriptSource; text: string; speaker?: number; provisional?: boolean }[]
   >([])
   const [interim, setInterim] = useState<{ interviewer: string; you: string }>({
     interviewer: '',
@@ -425,6 +432,26 @@ export default function OverlayView({
   const vadRef = useRef<Record<AudioSourceKind, { floor: number; lastVoiceTs: number }>>({
     system: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 },
     mic: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 }
+  })
+
+  // --- Immediate-commit for non-stop / overlapping speech --------------------
+  // Live copy of the interim previews so the promote timer can read the latest
+  // text without a stale closure.
+  const interimRef = useRef(interim)
+  useEffect(() => {
+    interimRef.current = interim
+  }, [interim])
+  // Whether a source currently has a line that was committed early from a still-
+  // growing preview (awaiting Deepgram's real final to replace it in place).
+  const hasProvisionalRef = useRef<Record<TranscriptSource, boolean>>({
+    interviewer: false,
+    you: false
+  })
+  // One-shot timer per source that promotes a long-running preview to a committed
+  // line (see INTERIM_PROMOTE_MS) so non-stop speech never waits for silence.
+  const promoteTimerRef = useRef<Record<TranscriptSource, ReturnType<typeof setTimeout> | null>>({
+    interviewer: null,
+    you: null
   })
 
   // Auto-answer is turn-based: we treat a run of interviewer finals as ONE turn
@@ -954,6 +981,25 @@ export default function OverlayView({
   }, [finals])
 
   useEffect(() => {
+    // Cancel a pending promote timer for a source.
+    const clearPromote = (src: TranscriptSource): void => {
+      const t = promoteTimerRef.current[src]
+      if (t) {
+        clearTimeout(t)
+        promoteTimerRef.current[src] = null
+      }
+    }
+    // Commit a preview that has run too long without finalising, so the
+    // transcript keeps flowing during non-stop speech. Marked `provisional` so
+    // Deepgram's real final can replace it in place instead of duplicating.
+    const promote = (src: TranscriptSource): void => {
+      promoteTimerRef.current[src] = null
+      const t = interimRef.current[src]?.trim()
+      if (!t || hasProvisionalRef.current[src]) return
+      hasProvisionalRef.current[src] = true
+      setFinals((prev) => [...prev, { source: src, text: t, provisional: true }])
+      setInterim((prev) => ({ ...prev, [src]: '' }))
+    }
     const offT = window.api.onTranscript(({ source, text, isFinal, speaker, confidence }) => {
       const kind: AudioSourceKind = source === 'interviewer' ? 'system' : 'mic'
       // Sarvam sends no confidence (its finals are undefined) and does its own
@@ -969,35 +1015,62 @@ export default function OverlayView({
       const highConfidence = conf !== undefined && conf >= HIGH_CONFIDENCE
       const lowConfidence = conf !== undefined && conf < MIN_CONFIDENCE
       if (isFinal) {
-        // Known hallucination phrases ("thanks for watching", lone "you", etc.)
-        // are always dropped — safe regardless of how the engine scored them.
-        if (isNoise(text)) {
+        // A final ends the current utterance, so cancel any pending promote timer.
+        clearPromote(source)
+        // Drop known hallucinations, and (unless Deepgram is very confident)
+        // anything with no real audio energy or low engine confidence.
+        const isBad = isNoise(text) || (!highConfidence && (!heardVoice || lowConfidence))
+        if (isBad) {
+          if (!isNoise(text) && !heardVoice)
+            console.debug('[vad] dropped silent hallucination:', text)
+          if (!isNoise(text) && lowConfidence)
+            console.debug('[conf] dropped low-confidence text:', conf, text)
+          // If a provisional line already showed this (real) speech, keep it as a
+          // committed line rather than erasing it; only clear the gray preview.
+          if (hasProvisionalRef.current[source]) {
+            hasProvisionalRef.current[source] = false
+            setFinals((prev) =>
+              prev.map((l) =>
+                l.provisional && l.source === source ? { ...l, provisional: false } : l
+              )
+            )
+          }
           setInterim((prev) => ({ ...prev, [source]: '' }))
           return
         }
-        // Trust a high-confidence Deepgram result outright: its professional VAD
-        // already validated real speech, so accept even if our crude RMS meter
-        // missed the energy (prevents discarding correct words).
-        if (!highConfidence) {
-          // Otherwise fall back to our gates: drop if no real audio energy was
-          // heard, or the engine itself was not confident.
-          if (!heardVoice || lowConfidence) {
-            if (!heardVoice) console.debug('[vad] dropped silent hallucination:', text)
-            if (lowConfidence) console.debug('[conf] dropped low-confidence text:', conf, text)
-            setInterim((prev) => ({ ...prev, [source]: '' }))
-            return
+        // Accepted final: if we committed this utterance early, replace that
+        // provisional line in place (now with the accurate text + speaker label);
+        // otherwise append a new line. This is what prevents duplicates.
+        setFinals((prev) => {
+          const idx = prev.findIndex((l) => l.provisional && l.source === source)
+          if (idx !== -1) {
+            const next = prev.slice()
+            next[idx] = { source, text, speaker, provisional: false }
+            return next
           }
-        }
-        setFinals((prev) => [...prev, { source, text, speaker }])
+          return [...prev, { source, text, speaker }]
+        })
+        hasProvisionalRef.current[source] = false
         setInterim((prev) => ({ ...prev, [source]: '' }))
       } else if (heardVoice || conf !== undefined) {
         // Live preview (interim). Deepgram sends a confidence with every partial
-        // (conf !== undefined), and its own professional VAD already decided this
-        // is speech — so show its partials immediately instead of waiting for our
-        // crude RMS meter to catch up. That removes the "it delays before showing
-        // the text" lag. This is safe: the FINAL result is still fully validated
-        // by the gates above, and a dropped/rejected final clears this preview.
-        setInterim((prev) => ({ ...prev, [source]: text }))
+        // and its own professional VAD already decided this is speech — so show
+        // partials immediately instead of waiting for our crude RMS meter.
+        if (hasProvisionalRef.current[source]) {
+          // This utterance was already committed early: keep refining that line
+          // in place instead of showing a separate gray preview below it.
+          setFinals((prev) =>
+            prev.map((l) => (l.provisional && l.source === source ? { ...l, text } : l))
+          )
+        } else {
+          setInterim((prev) => ({ ...prev, [source]: text }))
+          // Arm a one-shot timer (only when a fresh preview starts) so a preview
+          // that never finalises — non-stop / overlapping speech — is committed
+          // within INTERIM_PROMOTE_MS instead of waiting for a silence.
+          if (!promoteTimerRef.current[source]) {
+            promoteTimerRef.current[source] = setTimeout(() => promote(source), INTERIM_PROMOTE_MS)
+          }
+        }
       }
     })
     const offS = window.api.onTranscriptStatus(({ status, message }) => {
@@ -1006,6 +1079,8 @@ export default function OverlayView({
     return () => {
       offT()
       offS()
+      clearPromote('interviewer')
+      clearPromote('you')
     }
   }, [])
 
@@ -1082,6 +1157,10 @@ export default function OverlayView({
     setDgStatus('')
     setSpeakerNames({})
     lastAnalyzedCountRef.current = 0
+    hasProvisionalRef.current = { interviewer: false, you: false }
+    if (promoteTimerRef.current.interviewer) clearTimeout(promoteTimerRef.current.interviewer)
+    if (promoteTimerRef.current.you) clearTimeout(promoteTimerRef.current.you)
+    promoteTimerRef.current = { interviewer: null, you: null }
     vadRef.current = {
       system: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 },
       mic: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 }
@@ -1273,7 +1352,7 @@ export default function OverlayView({
                   source={line.source}
                   text={line.text}
                   speaker={line.speaker}
-                  interim={false}
+                  interim={!!line.provisional}
                   meeting={isMeeting}
                   name={line.speaker != null ? speakerNames[line.speaker] : undefined}
                 />
