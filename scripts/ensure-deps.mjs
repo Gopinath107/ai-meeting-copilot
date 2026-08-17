@@ -5,40 +5,68 @@
 // "electron-vite is not recognized". This guard runs first: if the toolchain is
 // missing it reinstalls; if only the Electron binary is missing it repairs that
 // (fast, from the local cache). When everything is present it does nothing.
-import { existsSync } from 'node:fs'
+import { existsSync, readFileSync } from 'node:fs'
 import { spawnSync } from 'node:child_process'
 import { join, dirname } from 'node:path'
 import { fileURLToPath } from 'node:url'
 
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const nm = join(root, 'node_modules')
-const toolchain = join(nm, 'electron-vite', 'package.json')
+const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const requiredPackages = [
+  ...Object.keys(manifest.dependencies ?? {}),
+  ...Object.keys(manifest.devDependencies ?? {})
+]
+const electronExecutable =
+  process.platform === 'win32'
+    ? 'electron.exe'
+    : process.platform === 'darwin'
+      ? join('Electron.app', 'Contents', 'MacOS', 'Electron')
+      : 'electron'
 const electronExe = join(
   nm,
   'electron',
   'dist',
-  process.platform === 'win32' ? 'electron.exe' : 'electron'
+  electronExecutable
+)
+const bundledNpmCli = join(dirname(process.execPath), 'node_modules', 'npm', 'bin', 'npm-cli.js')
+const npmCli = [process.env.npm_execpath, bundledNpmCli].find(
+  (candidate) => candidate && existsSync(candidate)
 )
 
 function run(cmd, args, extraEnv = {}) {
   const r = spawnSync(cmd, args, {
     cwd: root,
     stdio: 'inherit',
-    shell: true,
+    shell: false,
     env: { ...process.env, ...extraEnv }
   })
-  return r.status ?? 0
+  return r.status ?? 1
 }
 
-if (!existsSync(toolchain)) {
-  console.log('[ensure-deps] node_modules missing or incomplete — running npm install...')
+function runNpm(args, extraEnv = {}) {
+  if (npmCli) return run(process.execPath, [npmCli, ...args], extraEnv)
+  if (process.platform !== 'win32') return run('npm', args, extraEnv)
+  console.error('[ensure-deps] npm CLI could not be located. Reinstall Node.js with npm included.')
+  return 1
+}
+
+const dependenciesHealthy =
+  existsSync(nm) && requiredPackages.every((name) => existsSync(join(nm, name, 'package.json')))
+
+if (!dependenciesHealthy) {
+  console.log('[ensure-deps] node_modules missing or incomplete — running npm ci...')
   const useSystemCa =
-    Number(process.versions.node.split('.')[0]) >= 22 ? '--use-system-ca' : ''
-  const code = run('npm', ['install', '--no-audit', '--no-fund'], {
+    process.allowedNodeEnvironmentFlags.has('--use-system-ca') &&
+    !/(?:^|\s)--use-system-ca(?:\s|$)/.test(process.env.NODE_OPTIONS ?? '')
+    ? '--use-system-ca'
+    : ''
+  const code = runNpm(['ci', '--no-audit', '--no-fund'], {
     NODE_OPTIONS: `${process.env.NODE_OPTIONS || ''} ${useSystemCa}`.trim()
   })
   process.exit(code)
 } else if (!existsSync(electronExe)) {
   console.log('[ensure-deps] Electron binary missing — repairing from cache...')
-  run(process.execPath, [join(root, 'scripts', 'ensure-electron.mjs')])
+  const code = run(process.execPath, [join(root, 'scripts', 'ensure-electron.mjs')])
+  process.exit(code)
 }

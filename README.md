@@ -1,12 +1,15 @@
-# Interview Copilot
+# AI Meeting Copilot
 
-A stealth, real-time interview copilot for Windows. It listens to your meeting audio,
-transcribes it live (Deepgram), and streams AI answer suggestions (Azure OpenAI) into a
+A private, real-time interview and meeting copilot for Windows. It listens to meeting audio,
+transcribes it live (Sarvam AI with Deepgram fallback), and streams AI answer suggestions
+(Azure OpenAI) into a
 floating overlay that is **hidden from screen sharing / recording**.
 
 - **Stealth overlay** — excluded from screen capture (Zoom / Teams / Meet / OBS / Game Bar).
   You see it; people viewing your shared screen do not.
-- **Live transcription** with multi-interviewer diarization ("Interviewer 1/2/3").
+- **Live transcription** through Sarvam AI or Deepgram. Deepgram adds multi-speaker
+  diarization ("Interviewer 1/2/3").
+- **Screen-aware answers** that combine the transcript with an on-demand current-screen snapshot.
 - **Streaming AI answers** grounded in your résumé + job description.
 - **Manual question box** for scenario / long questions.
 - 100% Node.js / TypeScript — no Python required.
@@ -19,11 +22,14 @@ floating overlay that is **hidden from screen sharing / recording**.
 ## 1. Prerequisites
 
 - **Windows 10/11 (x64)**
-- **Node.js 20+** (Node 22 LTS recommended — required for the `--use-system-ca` flag below)
+- **Node.js 20.19+** (Node 22 LTS recommended; setup feature-detects `--use-system-ca`)
 - **npm** (ships with Node)
 - API keys:
-  - **Deepgram** API key (speech-to-text)
+  - At least one speech provider:
+    - **Sarvam AI** API key (primary in Auto mode)
+    - **Deepgram** API key (automatic fallback and speaker labels)
   - **Azure OpenAI** resource: endpoint, API key, and a chat deployment (e.g. `gpt-4o`)
+    - Screen-aware mode additionally requires a deployment that supports image/vision input.
 
 ---
 
@@ -36,7 +42,8 @@ npm install
 ### Behind a corporate TLS-inspection proxy
 
 If `npm install` (or the Electron binary download) fails with
-`unable to get local issuer certificate`, trust the Windows certificate store for the install:
+`unable to get local issuer certificate`, use Node 22/24 and trust the Windows certificate store
+for the install (the automated setup feature-detects this flag):
 
 ```powershell
 $env:NODE_OPTIONS = '--use-system-ca'
@@ -60,7 +67,7 @@ You can supply keys **either** way (the in-app Settings win over `.env`):
 
 1. Launch the app (see below).
 2. Click **Settings** (top-right of the Setup screen).
-3. Paste your Deepgram + Azure keys and the Azure endpoint / deployment / API version.
+3. Paste a Sarvam and/or Deepgram key, plus the Azure key, endpoint, deployment, and API version.
 4. **Save.**
 
 Keys are stored locally in your user app-data folder
@@ -75,11 +82,12 @@ Copy-Item .env.example .env
 Then edit `.env`:
 
 ```ini
-DEEPGRAM_API_KEY=your_deepgram_key
+SARVAM_API_KEY=your_sarvam_key
+DEEPGRAM_API_KEY=your_optional_deepgram_fallback_key
 
 AZURE_OPENAI_ENDPOINT=https://your-resource.openai.azure.com/
 AZURE_OPENAI_API_KEY=your_azure_key
-AZURE_OPENAI_DEPLOYMENT=rudhra-gpt-5.4-mini
+AZURE_OPENAI_DEPLOYMENT=your-deployment-name
 AZURE_OPENAI_API_VERSION=2024-12-01-preview
 
 # Only if your corporate proxy breaks the Deepgram TLS handshake (insecure — see notes):
@@ -107,7 +115,10 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; $env:NODE_OPT
 > `--use-system-ca` is left in `NODE_OPTIONS`.
 
 The overlay opens on the **Setup** screen. Fill in role / job description, optionally pick a
-résumé (PDF / DOCX / TXT), then **Start session**.
+résumé (PDF / DOCX / TXT / Markdown), then **Start session**. Documents are limited to
+8 MB each; reference selections allow up to 8 files and 24 MB total before extraction.
+PDFs are capped at 100 pages, DOCX archives are checked for excessive expansion, and parsing has
+a bounded timeout so a malformed document cannot silently stall normal setup.
 
 ---
 
@@ -116,8 +127,13 @@ résumé (PDF / DOCX / TXT), then **Start session**.
 1. Join your interview through your **own** meeting link as normal (do not bot-join).
 2. In the overlay, click **Start listening** (and toggle **Mic** if you want your own voice
    transcribed too).
-3. AI answers stream automatically when an interviewer asks a question, or trigger them
+3. Turn **Screen on** before starting if you want visual context, then choose the display that
+   contains the meeting, browser, code, or document you want the AI to see. The app keeps that
+   display track locally and sends one compressed frame only when an answer or user-triggered
+   analysis request runs; it does not continuously upload screen video.
+4. AI answers stream automatically when an interviewer asks a question, or trigger them
    manually with the hotkey / **Answer** button, or type a question in the manual box.
+5. Click **See screen** to request an immediate screen-focused answer or meeting analysis.
 
 ### Hotkeys
 
@@ -156,6 +172,9 @@ Other build commands:
 | `npm run build` | Type-check + build the production bundles (`out/`) |
 | `npm run build:unpack` | Build an unpacked app folder (no installer) |
 | `npm run typecheck` | Type-check only |
+| `npm run lint` | Run static lint checks |
+| `npm test` | Run the automated regression suite |
+| `npm run check` | Run lint, type-checking, and tests |
 
 > The installer is **not code-signed**, so Windows SmartScreen shows an "unknown publisher"
 > warning on first run — expected. To brand it, drop an `icon.ico` (256×256) into `build/`
@@ -169,11 +188,13 @@ Other build commands:
 src/
   main/        Electron main process
     index.ts     window, stealth, hotkeys, tray, audio + IPC wiring
+    sarvam.ts    Sarvam streaming WebSocket (Auto-mode primary)
     deepgram.ts  Deepgram streaming WebSocket (diarization)
     azure.ts     Azure OpenAI streaming via Electron net.fetch
     settings.ts  local key store (userData JSON, .env fallback)
   preload/     contextBridge API exposed to the renderer
   renderer/    React + Tailwind UI (Setup + Overlay views, Settings panel)
+  shared/      IPC-safe types shared by main, preload, and renderer
 electron-builder.yml   packaging config
 electron.vite.config.ts
 ```
@@ -182,9 +203,13 @@ electron.vite.config.ts
 
 ## 8. Troubleshooting
 
-- **No transcript appears / Deepgram error badge** — corporate TLS inspection is breaking the
-  speech connection. Enable **Allow insecure TLS** in Settings (or `DEEPGRAM_ALLOW_INSECURE_TLS=true`
-  in `.env`) and restart. Proper fix: set `NODE_EXTRA_CA_CERTS` to your exported corporate root cert.
+- **No transcript appears** — confirm the selected provider has a key. Auto mode tries Sarvam first
+  and falls back to Deepgram. Prefer installing the corporate root CA when TLS inspection breaks a
+  speech connection; disabling certificate verification should only be a short-lived diagnostic.
+- **See screen has no image** — turn Screen on before listening, select the correct display, and
+  restart capture after changing displays. If Teams/Zoom or a browser moved monitors, stop,
+  refresh the display list, select that full display, and start again. Protected/DRM video can
+  remain black because Windows intentionally prevents applications from capturing it.
 - **AI says "not configured"** — the Azure endpoint, key, or deployment is missing in Settings / `.env`.
 - **Electron won't start after install** — make sure `NODE_OPTIONS` does **not** contain
   `--use-system-ca` when running `npm run dev`.
@@ -195,5 +220,15 @@ electron.vite.config.ts
 
 ## Security note
 
-API keys are read by the **main process only** and are never exposed to the renderer/UI. Keep
-your `.env` private (it is git-ignored) and prefer the in-app Settings store for real keys.
+API keys are read by the **main process only** and are never shown back in the renderer/UI. A
+development `.env` must remain untracked and must never be committed; prefer in-app Settings for
+local use and rotate any key that has ever entered Git history.
+Screen snapshots are opt-in and are sent to the configured Azure AI deployment only when an
+answer or explicit screen/analysis request is made. They are not added to conversation history,
+summaries, minutes, or local files.
+
+## Deployment scope
+
+This is an Electron desktop application, not a browser-hosted website. The renderer requires the
+trusted preload bridge (`window.api`) and is intentionally not deployable to Vercel or another
+static web host by itself.

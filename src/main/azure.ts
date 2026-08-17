@@ -10,7 +10,15 @@ export interface AzureConfig {
 
 export interface ChatMessage {
   role: 'system' | 'user' | 'assistant'
-  content: string
+  content:
+    | string
+    | Array<
+        | { type: 'text'; text: string }
+        | {
+            type: 'image_url'
+            image_url: { url: string; detail?: 'low' | 'auto' | 'high' }
+          }
+      >
 }
 
 export interface StreamHandlers {
@@ -102,6 +110,9 @@ function describeError(status: number, detail: string): string {
   if (status === 404) {
     return `Deployment not found (404): check the deployment name and api-version. ${detail}`.trim()
   }
+  if (status === 400 && /image|vision|image_url|multimodal/i.test(detail)) {
+    return 'This Azure deployment rejected the screen image. Use a vision-capable deployment, or turn Screen off and try again.'
+  }
   return `AI request failed (${status}) ${detail}`.trim()
 }
 
@@ -123,7 +134,9 @@ export async function streamChat(
   signal?: AbortSignal
 ): Promise<void> {
   const base = config.endpoint.replace(/\/+$/, '')
-  const url = `${base}/openai/deployments/${config.deployment}/chat/completions?api-version=${config.apiVersion}`
+  const deployment = encodeURIComponent(config.deployment)
+  const apiVersion = encodeURIComponent(config.apiVersion)
+  const url = `${base}/openai/deployments/${deployment}/chat/completions?api-version=${apiVersion}`
 
   const body: Record<string, unknown> = {
     messages,

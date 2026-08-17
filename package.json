@@ -1,9 +1,12 @@
 {
   "name": "ai-meeting-copilot",
   "version": "0.1.0",
-  "description": "Stealth real-time interview copilot (transcription + live AI suggestions)",
+  "description": "Desktop interview and meeting copilot with live transcription and AI guidance",
   "main": "./out/main/index.js",
   "private": true,
+  "engines": {
+    "node": "^20.19.0 || ^22.13.0 || >=24.0.0"
+  },
   "scripts": {
     "setup": "node scripts/setup.mjs",
     "postinstall": "node scripts/ensure-electron.mjs",
@@ -13,6 +16,10 @@
     "build:unpack": "npm run build && electron-builder --dir",
     "build:win": "npm run build && electron-builder --win",
     "preview": "electron-vite preview",
+    "lint": "eslint .",
+    "test": "vitest run",
+    "test:watch": "vitest",
+    "check": "npm run lint && npm run typecheck && npm run test",
     "typecheck:node": "tsc --noEmit -p tsconfig.node.json --composite false",
     "typecheck:web": "tsc --noEmit -p tsconfig.web.json --composite false",
     "typecheck": "npm run typecheck:node && npm run typecheck:web"
@@ -34,12 +41,18 @@
     "@types/react-dom": "^18.3.1",
     "@types/ws": "^8.18.1",
     "@vitejs/plugin-react": "^4.3.4",
+    "@eslint/js": "^10.0.1",
     "electron": "^33.4.11",
     "electron-builder": "^26.15.3",
     "electron-vite": "^2.3.0",
     "postcss": "^8.4.49",
     "tailwindcss": "^3.4.15",
+    "eslint": "^10.8.1",
+    "eslint-plugin-react-hooks": "^7.0.1",
+    "globals": "^17.3.0",
     "typescript": "^5.6.3",
-    "vite": "^5.4.11"
+    "typescript-eslint": "^8.67.0",
+    "vite": "^5.4.11",
+    "vitest": "^4.1.10"
   }
 }

@@ -1,40 +1,42 @@
 import { useEffect, useRef, useState } from 'react'
 import type { SessionConfig, SessionMode } from '../App'
 import { AudioCapture, type AudioSourceKind } from '../audio/AudioCapture'
-import { Markdown } from '../components/Markdown'
-
-function Meter({
-  label,
-  level,
-  seconds,
-  active
-}: {
-  label: string
-  level: number
-  seconds: number
-  active: boolean
-}) {
-  const pct = Math.min(100, Math.round(level * 160))
-  return (
-    <div className="flex-1">
-      <div className="mb-1 flex items-center justify-between text-[10px] text-zinc-400">
-        <span>{label}</span>
-        <span>{active ? `${seconds.toFixed(1)}s` : 'idle'}</span>
-      </div>
-      <div className="h-1.5 w-full overflow-hidden rounded-full bg-white/10">
-        <div
-          className="h-full rounded-full bg-gradient-to-r from-emerald-400 to-lime-300 transition-[width] duration-75"
-          style={{ width: `${pct}%` }}
-        />
-      </div>
-    </div>
-  )
-}
-
-type TranscriptSource = 'interviewer' | 'you'
-
-// Distinct colours so a panel of interviewers is easy to tell apart.
-const INTERVIEWER_COLORS = ['text-amber-300', 'text-orange-300', 'text-yellow-300', 'text-rose-300']
+import type { AiIntent, AiTextMessage, ScreenshotContext } from '../../../shared/ai'
+import type { DisplaySourceInfo } from '../../../shared/capture'
+import {
+  buildInterviewSystemPrompt as createInterviewSystemPrompt,
+  buildMeetingSystemPrompt as createMeetingSystemPrompt,
+  buildMinutesPrompt as createMinutesPrompt,
+  buildSpeechKeyterms,
+  buildSummarizerPrompt as createSummarizerPrompt
+} from './overlay/prompts'
+import {
+  createSessionTrackingState,
+  formatTranscript,
+  mergeTranscriptForMinutes,
+  shouldMarkAiRangeHandled,
+  type PendingHandledRange,
+  type TranscriptEntry,
+  type TranscriptInterim,
+  type TranscriptSource
+} from './overlay/session'
+import {
+  TranscriptPanel,
+  type CaptureDisplayState
+} from './overlay/TranscriptPanel'
+import { CaptureControls, type SpeechProvider } from './overlay/CaptureControls'
+import { MinutesModal } from './overlay/MinutesModal'
+import {
+  AiWorkspace,
+  type AiWorkspaceIntent,
+  type AiWorkspaceTab
+} from './overlay/AiWorkspace'
+import {
+  createAiAskRequest,
+  createAiRequestId,
+  isDirectedAtMe,
+  looksLikeQuestion
+} from './overlay/aiOrchestration'
 
 /**
  * Speech-to-text models (Sarvam/Whisper-style and Deepgram) hallucinate filler
@@ -152,155 +154,6 @@ const SUMMARY_TRIGGER = 18
 // so the latest exchange stays exact for the AI.
 const SUMMARY_KEEP_RECENT = 12
 
-// Common software/architecture terms always sent as Deepgram keyterms so jargon
-// is transcribed correctly even when the user leaves the tech-stack field empty
-// (e.g. "Spring Boot" instead of "ring board"). Merged with the user's own
-// stack/context terms in buildKeyterms(). English-only, nova-3 feature.
-const DEFAULT_TECH_KEYTERMS = [
-  'Spring Boot',
-  'Spring',
-  'Hibernate',
-  'Java',
-  'Kotlin',
-  'JavaScript',
-  'TypeScript',
-  'Python',
-  'Node.js',
-  'Express',
-  'React',
-  'Angular',
-  'Vue',
-  'Next.js',
-  'PostgreSQL',
-  'MySQL',
-  'MongoDB',
-  'Redis',
-  'Kafka',
-  'RabbitMQ',
-  'Elasticsearch',
-  'Docker',
-  'Kubernetes',
-  'Microservices',
-  'REST API',
-  'GraphQL',
-  'gRPC',
-  'JWT',
-  'OAuth',
-  'OpenID Connect',
-  'JSON',
-  'YAML',
-  'SQL',
-  'NoSQL',
-  'CI/CD',
-  'Jenkins',
-  'Terraform',
-  'AWS',
-  'Azure',
-  'GCP',
-  'Lambda',
-  'DynamoDB',
-  'Nginx',
-  'API Gateway',
-  'load balancer',
-  'caching',
-  'authentication',
-  'authorization',
-  'endpoint',
-  'middleware',
-  'schema',
-  'migration',
-  'webhook',
-  'idempotency',
-  'rate limiting'
-]
-
-/**
- * Decide whether an interviewer utterance is a prompt that deserves an answer.
- *
- * The old logic only fired when the text ended with a literal '?', so it missed
- * the way interviewers actually speak: imperatives and indirect questions
- * ("Tell me about yourself", "Walk me through your project", "Explain how X
- * works") rarely end in '?', and the speech-to-text doesn't always add one.
- * We bias toward triggering, but require a little substance (>= 2 words) when
- * there's no '?', so a stray one-word phantom can't set it off.
- */
-function looksLikeQuestion(raw: string): boolean {
-  const text = raw.trim()
-  if (text.length < 3) return false
-  if (/\?\s*$/.test(text)) return true
-  // No question mark: demand at least two words so lone "what" / "how" misfires die.
-  if (text.split(/\s+/).length < 2) return false
-  const t = text.toLowerCase()
-  // Interrogatives / auxiliaries that start a direct question.
-  const starters =
-    /^(what|why|how|when|where|which|who|whose|whom|can|could|would|will|shall|should|do|does|did|are|is|was|were|have|has|had|may|might)\b/
-  if (starters.test(t)) return true
-  // Imperative lead-ins interviewers use instead of a question mark.
-  const prompts =
-    /\b(tell me|walk me through|run me through|take me through|describe|explain|elaborate|define|compare|contrast|give me|share|discuss|talk about|talk to me about|let'?s talk|how would you|what would you|what is|what are|how do you|how does|why do|why is|difference between|your thoughts on|your experience with)\b/
-  if (prompts.test(t)) return true
-  return false
-}
-
-/**
- * In a group meeting, decide whether an utterance is aimed at ME specifically
- * (so the AI should draft an answer for me to say) rather than being general
- * team discussion (which the AI just analyses). We trigger on my name or on
- * clear second-person question cues.
- */
-function isDirectedAtMe(raw: string, userName?: string): boolean {
-  const t = raw.trim().toLowerCase()
-  if (t.length < 3) return false
-  const name = userName?.trim().toLowerCase()
-  if (name) {
-    const first = name.split(/\s+/)[0]
-    if (first && first.length >= 2) {
-      const re = new RegExp(`\\b${first.replace(/[.*+?^${}()|[\]\\]/g, '\\$&')}\\b`)
-      if (re.test(t)) return true
-    }
-  }
-  // Second-person cues that indicate the speaker is asking the listener (me).
-  const youCues =
-    /\b(what do you think|your thoughts|your take|can you|could you|would you|how would you|what would you|do you (know|think|have)|any (thoughts|ideas|input)|over to you|what about you|your opinion)\b/
-  if (youCues.test(t) && looksLikeQuestion(raw)) return true
-  return false
-}
-
-function TranscriptLine({
-  source,
-  text,
-  interim,
-  speaker,
-  meeting,
-  name
-}: {
-  source: TranscriptSource
-  text: string
-  interim: boolean
-  speaker?: number
-  meeting?: boolean
-  name?: string
-}) {
-  const isInterviewer = source === 'interviewer'
-  const color = isInterviewer
-    ? INTERVIEWER_COLORS[(speaker ?? 0) % INTERVIEWER_COLORS.length]
-    : 'text-sky-300'
-  const speakerWord = meeting ? 'Speaker' : 'Interviewer'
-  const label = isInterviewer
-    ? name?.trim()
-      ? name.trim()
-      : speaker != null
-        ? `${speakerWord} ${speaker + 1}`
-        : speakerWord
-    : 'You'
-  return (
-    <div className={interim ? 'opacity-60' : ''}>
-      <span className={`mr-1.5 text-[10px] font-semibold uppercase ${color}`}>{label}</span>
-      <span>{text}</span>
-    </div>
-  )
-}
-
 function EyeIcon({ off }: { off: boolean }) {
   return off ? (
     <svg
@@ -342,14 +195,15 @@ export default function OverlayView({
   config: SessionConfig | null
   onBack: () => void
 }) {
-  const [finals, setFinals] = useState<
-    { source: TranscriptSource; text: string; speaker?: number; provisional?: boolean }[]
-  >([])
-  const [interim, setInterim] = useState<{ interviewer: string; you: string }>({
+  const [finals, setFinals] = useState<TranscriptEntry[]>([])
+  const [interim, setInterim] = useState<TranscriptInterim>({
     interviewer: '',
     you: ''
   })
-  const [dgStatus, setDgStatus] = useState<string>('')
+  const [statusBySource, setStatusBySource] = useState<Record<TranscriptSource, string>>({
+    interviewer: '',
+    you: ''
+  })
   const [suggestion, setSuggestion] = useState<string>('')
   // Completed past answers, kept on screen so a new response never wipes what
   // you're still reading. New answers append below these; the Clear button empties them.
@@ -358,10 +212,18 @@ export default function OverlayView({
   const [aiError, setAiError] = useState<string | null>(null)
   const [autoAnswer, setAutoAnswer] = useState(true)
   const [manualQuestion, setManualQuestion] = useState('')
-  const transcriptRef = useRef<HTMLDivElement>(null)
 
   const captureRef = useRef<AudioCapture | null>(null)
-  const [capturing, setCapturing] = useState(false)
+  const [captureState, setCaptureState] = useState<CaptureDisplayState>('idle')
+  const captureStateRef = useRef<CaptureDisplayState>('idle')
+  const captureAttemptRef = useRef(0)
+  const capturing = captureState === 'active'
+  const captureBusy = captureState !== 'idle'
+
+  function updateCaptureState(next: CaptureDisplayState): void {
+    captureStateRef.current = next
+    setCaptureState(next)
+  }
   // Mic (your own voice) is off by default — we only need the interviewer
   // (system audio). The toggle stays for testing/diagnostics.
   const [micEnabled, setMicEnabled] = useState(false)
@@ -369,34 +231,57 @@ export default function OverlayView({
   const [levels, setLevels] = useState<{ system: number; mic: number }>({ system: 0, mic: 0 })
   const [seconds, setSeconds] = useState<{ system: number; mic: number }>({ system: 0, mic: 0 })
   const [audioError, setAudioError] = useState<string | null>(null)
+  // Screen-aware mode keeps the display video track locally and sends one
+  // compressed frame only when an AI answer/analysis request is made.
+  const [screenEnabled, setScreenEnabled] = useState(false)
+  const [screenReady, setScreenReady] = useState(false)
+  const [screenError, setScreenError] = useState<string | null>(null)
+  const [lastScreenSentAt, setLastScreenSentAt] = useState<number | null>(null)
+  const [displaySources, setDisplaySources] = useState<DisplaySourceInfo[]>([])
+  const [selectedDisplaySourceId, setSelectedDisplaySourceId] = useState('')
+  const selectedDisplaySourceIdRef = useRef('')
+  const [loadingDisplaySources, setLoadingDisplaySources] = useState(false)
+  const screenEnabledRef = useRef(screenEnabled)
+  const screenReadyRef = useRef(screenReady)
+  useEffect(() => {
+    screenEnabledRef.current = screenEnabled
+  }, [screenEnabled])
+  useEffect(() => {
+    screenReadyRef.current = screenReady
+  }, [screenReady])
 
   // ----- Meeting mode -----
   const mode: SessionMode = config?.mode ?? 'interview'
-  const isMeeting = mode === 'meeting'
-  // Speech provider for this session. Deepgram is the default in BOTH modes: its
-  // nova-3 English model is multidialect (British/UK, American and other native
-  // accents) and the most accurate choice for ~100% English speech, and it also
-  // labels each speaker. Sarvam's only English model is en-IN (Indian-accent
-  // tuned), so it's offered as an option but not the default. 'auto' = Sarvam
-  // primary + Deepgram fallback.
-  type Provider = 'auto' | 'deepgram' | 'sarvam'
-  const [provider, setProvider] = useState<Provider>('deepgram')
+  const isConsultant = mode === 'consultant'
+  const isMeeting = mode !== 'interview'
+  // Auto follows the Settings contract: Sarvam first, Deepgram fallback.
+  const [provider, setProvider] = useState<SpeechProvider>('auto')
   const [analysis, setAnalysis] = useState('')
   // Completed past analyses, kept on screen (same reasoning as answerHistory).
   const [analysisHistory, setAnalysisHistory] = useState<string[]>([])
-  const [autoAnalyze, setAutoAnalyze] = useState(isMeeting)
-  const [activeTab, setActiveTab] = useState<'analysis' | 'answer'>(
-    isMeeting ? 'analysis' : 'answer'
+  const [consultant, setConsultant] = useState('')
+  const [consultantHistory, setConsultantHistory] = useState<string[]>([])
+  const [autoAnalyze, setAutoAnalyze] = useState(mode === 'meeting')
+  const [activeTab, setActiveTab] = useState<AiWorkspaceTab>(
+    isConsultant ? 'consultant' : isMeeting ? 'analysis' : 'answer'
   )
   // Which kind of AI request is currently streaming, so tokens land in the right
   // pane (the main process only runs one stream at a time).
-  const intentRef = useRef<'answer' | 'analyze' | 'summarize' | 'minutes'>('answer')
+  const [activeIntent, setActiveIntent] = useState<AiWorkspaceIntent>('answer')
+  const intentRef = useRef<AiWorkspaceIntent>('answer')
+  const activeAiRequestIdRef = useRef<string | null>(null)
+  const activeHandledRangeRef = useRef<PendingHandledRange | null>(null)
+  const activeAiSessionRef = useRef(0)
+  const aiRequestSequenceRef = useRef(0)
   const analysisAccRef = useRef('')
+  const consultantAccRef = useRef('')
   // Minutes of Meeting: generated on demand when the meeting is ended, from the
   // full transcript. Shown in a modal overlay so it never disrupts the live UI.
   const [minutes, setMinutes] = useState('')
   const [minutesOpen, setMinutesOpen] = useState(false)
   const [minutesError, setMinutesError] = useState<string | null>(null)
+  const [minutesPreparing, setMinutesPreparing] = useState(false)
+  const [minutesNotice, setMinutesNotice] = useState<string | null>(null)
   const [minutesCopied, setMinutesCopied] = useState(false)
   const minutesAccRef = useRef('')
   const autoAnalyzeRef = useRef(autoAnalyze)
@@ -438,6 +323,10 @@ export default function OverlayView({
     system: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 },
     mic: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 }
   })
+  const lastFinalTranscriptAtRef = useRef<Record<AudioSourceKind, number>>({
+    system: 0,
+    mic: 0
+  })
 
   // --- Immediate-commit for non-stop / overlapping speech --------------------
   // Live copy of the interim previews so the promote timer can read the latest
@@ -446,6 +335,26 @@ export default function OverlayView({
   useEffect(() => {
     interimRef.current = interim
   }, [interim])
+
+  function updateFinals(
+    updater: TranscriptEntry[] | ((previous: TranscriptEntry[]) => TranscriptEntry[])
+  ): void {
+    setFinals((previous) => {
+      const next = typeof updater === 'function' ? updater(previous) : updater
+      finalsRef.current = next
+      return next
+    })
+  }
+
+  function updateInterim(
+    updater: TranscriptInterim | ((previous: TranscriptInterim) => TranscriptInterim)
+  ): void {
+    setInterim((previous) => {
+      const next = typeof updater === 'function' ? updater(previous) : updater
+      interimRef.current = next
+      return next
+    })
+  }
   // Whether a source currently has a line that was committed early from a still-
   // growing preview (awaiting Deepgram's real final to replace it in place).
   const hasProvisionalRef = useRef<Record<TranscriptSource, boolean>>({
@@ -471,6 +380,19 @@ export default function OverlayView({
   const maxWaitTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
   const turnHasQuestionRef = useRef(false)
   const turnDirectedRef = useRef(false)
+  const queuedInterviewQuestionRef = useRef(false)
+
+  // Transcript events are accepted only while this renderer owns a live or
+  // gracefully-finalizing capture. A new-session reset increments the session
+  // generation and closes this gate so late events cannot repopulate cleared UI.
+  const sessionGenerationRef = useRef(0)
+  const acceptingTranscriptsRef = useRef(false)
+  const lastTranscriptEventAtRef = useRef(0)
+
+  // Audio worklet level events can arrive rapidly. VAD still receives every
+  // sample, while visual meters are updated at a bounded cadence.
+  const pendingLevelsRef = useRef<{ system: number; mic: number }>({ system: 0, mic: 0 })
+  const meterTimerRef = useRef<ReturnType<typeof setTimeout> | null>(null)
 
   // Conversation memory: prior (question -> answer) turns so the model can
   // resolve follow-ups like "explain that code", "add error handling", or
@@ -490,84 +412,12 @@ export default function OverlayView({
   const summaryAccRef = useRef('')
 
   function buildSystemPrompt(): string {
-    if (isMeeting) return buildMeetingSystemPrompt()
-    const role = config?.role?.trim()
-    const jd = config?.jobDescription?.trim()
-    const resume = config?.resumeText?.trim()
-    const docs = config?.docsText?.trim()
-    return [
-      'You are an expert real-time interview assistant helping the candidate answer out loud.',
-      'Reply in the first person AS the candidate, concise and natural.',
-      'The question comes from speech-to-text and may contain recognition errors, especially for technical terms (e.g. "ring board" means "Spring Boot", "power gres" means "PostgreSQL", "jason" means "JSON"). Infer the intended meaning and answer using the correct canonical terms rather than the literal mis-transcribed words.',
-      'You are given the recent conversation as memory. If the candidate says things like "explain that", "add X", "optimise it", "make it shorter", or "that code", they mean YOUR previous answer — build on it directly instead of starting a new topic.',
-      'Format every answer in Markdown so it is easy to scan: use short "-" bullet points for lists, steps, or multi-part answers, **bold** for key terms, and short paragraphs for narrative answers.',
-      'For behavioural or scenario-based questions, answer with the STAR method (Situation, Task, Action, Result) in a natural spoken flow of about 60-120 words; bullets are optional here.',
-      'For long multi-part questions, give one short bullet per part so nothing is missed.',
-      'For technical or programming questions: open with 2-3 short bullets of explanation, then give the solution in a fenced code block tagged with the language (for example ```python). Write the SHORTEST correct, idiomatic implementation — minimal lines, no boilerplate, no obvious or verbose comments, no dead code — then finish with a one-line note on time and space complexity. Be precise and use correct terminology, but keep the code compact.',
-      'Put any code, commands, JSON, or SQL inside fenced code blocks with the correct language tag — never inline in a sentence.',
-      'Use specifics; avoid filler and disclaimers. Output only the answer the candidate should give.',
-      'Never fabricate. Do not invent facts, numbers, statistics, dates, tools, company names, or personal experience. State concrete personal achievements only when they appear in the résumé or notes below; otherwise answer in general terms (e.g. "My approach would be…") rather than making up specifics.',
-      'In code and technical answers, use only real, standard, documented APIs, libraries, and methods — never invent function names, parameters, or behaviour. If you are unsure something exists, use a well-known alternative you are confident is correct.',
-      'If the question is ambiguous or required details are missing, state one brief assumption and answer it (or ask a short clarifying question) instead of guessing. Accuracy matters more than sounding impressive — never state something as fact unless you are confident it is true.',
-      role ? `Target role: ${role}.` : '',
-      jd ? `Job description:\n${jd}` : '',
-      resume
-        ? `Candidate résumé (ground answers in this real experience):\n${resume}`
-        : config?.resumeName
-          ? `Candidate résumé file: ${config.resumeName}.`
-          : '',
-      docs ? `Extra candidate notes:\n${docs}` : ''
-    ]
-      .filter(Boolean)
-      .join('\n')
-  }
-
-  function buildMeetingSystemPrompt(): string {
-    const role = config?.role?.trim()
-    const project = config?.projectContext?.trim()
-    const stack = config?.techStack?.trim()
-    const docs = config?.docsText?.trim()
-    const name = config?.userName?.trim()
-    return [
-      'You are a sharp, highly experienced professional with 20+ years in the room, silently assisting me during a live meeting. The meeting may be about ANYTHING — business, project planning, product, operations, finance, HR, strategy, or a general discussion — NOT necessarily technical. Adapt to whatever the topic actually is; do not force a technical framing.',
-      'Several participants (labelled Speaker 1, Speaker 2, ... or by name in the transcript) are talking. Follow the conversation and help me contribute like a seasoned expert.',
-      'Two request types will come to you — obey the one named in the user message:',
-      '',
-      '[ANALYZE] Give me a quick, senior-level read on what is being discussed so I can follow and contribute. Respond ONLY with this compact Markdown structure, omitting any section with nothing useful to add:',
-      '**Topic:** what is being discussed right now (one line).',
-      '**Key points:** 2-4 short bullets capturing what actually matters from the latest discussion.',
-      '**My input:** 1-3 bullets of what I could say or contribute right now — practical, relevant, adds value.',
-      '**Watch-outs:** anything being missed, a risk, or a wrong assumption (only if there is one).',
-      '**Follow-ups:** 1-2 sharp questions I could ask to move things forward (only if useful).',
-      'Keep it tight and skimmable — short bullets, **bold** key terms. No filler, no restating the transcript.',
-      '',
-      '[ANSWER] Something was asked or directed at me. Answer in the FIRST PERSON as me, ready to say out loud, the way a calm, confident person with 20 years of experience would speak. Lead with the direct answer in one or two sentences, then at most 2-4 crisp supporting points as short "-" bullets if needed. Keep it SHORT and natural — spoken, not an essay. Get to the point, sound composed and credible, and stop. Only include code/commands/numbers if the topic is actually technical and they are needed.',
-      '',
-      'The transcript is machine-generated (speech-to-text) and WILL contain recognition errors, especially for names, jargon, and product terms. Silently reconstruct the intended meaning before responding — reason about the speaker\'s INTENT, not the literal mis-transcribed words. If a word is truly ambiguous, pick the most likely meaning from context and proceed.',
-      '',
-      'Rules for both: Be concise above all — never pad. Never fabricate facts, numbers, names, dates, or details; if you do not know, speak in general terms rather than inventing specifics. Match the tone and domain of the actual meeting. Prefer sounding clear and experienced over sounding impressive.',
-      name ? `My name: ${name}.` : '',
-      role ? `My role: ${role}.` : '',
-      project ? `Meeting / project context:\n${project}` : '',
-      stack ? `Relevant background (tech stack or domain, if applicable): ${stack}.` : '',
-      docs ? `Reference docs:\n${docs}` : ''
-    ]
-      .filter(Boolean)
-      .join('\n')
+    if (isMeeting) return createMeetingSystemPrompt(config, isConsultant)
+    return createInterviewSystemPrompt(config)
   }
 
   function recentTranscript(n: number): string {
-    return finalsRef.current
-      .slice(-n)
-      .map((l) => {
-        if (l.source !== 'interviewer') return `Me: ${l.text}`
-        const named = l.speaker != null ? speakerNamesRef.current[l.speaker]?.trim() : ''
-        const who = named
-          ? named
-          : `${isMeeting ? 'Speaker' : 'Interviewer'}${l.speaker != null ? ' ' + (l.speaker + 1) : ''}`
-        return `${who}: ${l.text}`
-      })
-      .join('\n')
+    return formatTranscript(finalsRef.current.slice(-n), speakerNamesRef.current, isMeeting)
   }
 
   // The single most recent thing the OTHER side said — i.e. the actual question
@@ -615,39 +465,19 @@ export default function OverlayView({
   // Runs opportunistically while the stream is idle. It folds older transcript
   // lines into `meetingSummaryRef` so we keep full context without ever sending
   // the whole 2-hour transcript to the model.
-  function buildSummarizerPrompt(): string {
-    return [
-      'You maintain a running summary of a long live meeting so an AI assistant keeps full context even after one or two hours.',
-      'You are given the summary so far and the newer transcript lines that follow it. Merge the new lines into the summary and return the UPDATED summary.',
-      'Preserve every durable fact: decisions, action items and owners, requirements, agreed designs/architecture, open questions, disagreements, numbers, dates, and key technical details. Drop small talk and filler.',
-      'Write terse notes under short bold headings such as **Context**, **Decisions**, **Open questions**, **Action items**. Keep the whole summary under ~350 words by compressing older points, never dropping important ones.',
-      'The transcript is speech-to-text and may contain recognition errors; silently correct obvious technical or product-term mistakes.',
-      'Output ONLY the updated summary text — no preamble, no commentary.'
-    ].join('\n')
-  }
-
   function summarizeRange(fromIdx: number, toIdx: number): void {
     const lines = finalsRef.current.slice(fromIdx, toIdx)
     if (lines.length === 0) return
-    const text = lines
-      .map((l) => {
-        if (l.source !== 'interviewer') return `Me: ${l.text}`
-        const named = l.speaker != null ? speakerNamesRef.current[l.speaker]?.trim() : ''
-        const who = named
-          ? named
-          : `${isMeeting ? 'Speaker' : 'Interviewer'}${l.speaker != null ? ' ' + (l.speaker + 1) : ''}`
-        return `${who}: ${l.text}`
-      })
-      .join('\n')
+    const text = formatTranscript(lines, speakerNamesRef.current, isMeeting)
     intentRef.current = 'summarize'
+    setActiveIntent('summarize')
     summaryAccRef.current = ''
     summarizeTargetRef.current = toIdx
     setStreaming(true)
     streamingRef.current = true
     pendingUserRef.current = null
-    armWatchdog()
-    window.api.aiAsk([
-      { role: 'system', content: buildSummarizerPrompt() },
+    dispatchAiRequest('summarize', [
+      { role: 'system', content: createSummarizerPrompt() },
       {
         role: 'user',
         content:
@@ -677,19 +507,79 @@ export default function OverlayView({
       watchdogRef.current = null
     }
   }
-  function armWatchdog(): void {
+  function armWatchdog(requestId: string, timeoutMs = 30000): void {
     clearWatchdog()
     watchdogRef.current = setTimeout(() => {
+      if (activeAiRequestIdRef.current !== requestId) return
+      window.api.aiCancel(requestId)
+      activeAiRequestIdRef.current = null
+      activeHandledRangeRef.current = null
       streamingRef.current = false
       setStreaming(false)
-      setAiError((prev) => prev ?? 'No response from the AI (timed out). Ask again.')
-    }, 30000)
+      if (intentRef.current === 'minutes') {
+        setMinutesError('No response from the AI (timed out). Try generating minutes again.')
+      } else if (intentRef.current !== 'summarize') {
+        setAiError((prev) => prev ?? 'No response from the AI (timed out). Ask again.')
+      }
+      retryQueuedInterviewQuestion()
+    }, timeoutMs)
   }
 
-  function streamAnswer(user: string): void {
+  function captureScreenshot(): ScreenshotContext | undefined {
+    if (!screenEnabledRef.current || !screenReadyRef.current) return undefined
+    try {
+      const frame = captureRef.current?.captureScreenFrame()
+      if (!frame) {
+        setScreenError('The current screen frame is not ready; sending transcript only.')
+        return undefined
+      }
+      setScreenError(null)
+      setLastScreenSentAt(frame.capturedAt)
+      return { ...frame, detail: 'high' }
+    } catch (error) {
+      setScreenReady(false)
+      screenReadyRef.current = false
+      setScreenError(
+        `Could not capture the selected screen: ${(error as Error).message}. Sending transcript only.`
+      )
+      return undefined
+    }
+  }
+
+  function dispatchAiRequest(
+    intent: AiIntent,
+    messages: AiTextMessage[],
+    includeScreen = false,
+    handledRange: PendingHandledRange | null = null
+  ): void {
+    const requestId = createAiRequestId(
+      sessionGenerationRef.current,
+      ++aiRequestSequenceRef.current,
+      intent
+    )
+    const screenshot =
+      includeScreen && (intent === 'answer' || intent === 'analyze')
+        ? captureScreenshot()
+        : undefined
+    const request = createAiAskRequest({ requestId, intent, messages, screenshot })
+    activeAiRequestIdRef.current = requestId
+    activeHandledRangeRef.current = handledRange
+    activeAiSessionRef.current = sessionGenerationRef.current
+    armWatchdog(requestId, request.screenshot ? 45000 : 30000)
+    window.api.aiAsk(request)
+  }
+
+  function streamAnswer(
+    user: string,
+    includeScreen = screenEnabledRef.current,
+    handledRange: PendingHandledRange | null = null
+  ): void {
     // Supersede any in-flight request so a new question is never blocked.
-    if (streamingRef.current) window.api.aiCancel()
+    if (streamingRef.current) {
+      window.api.aiCancel(activeAiRequestIdRef.current ?? undefined)
+    }
     intentRef.current = 'answer'
+    setActiveIntent('answer')
     // Note: we do NOT switch the active tab here. Auto-answer fires on every
     // question, and force-switching kept yanking you between Answer/Analysis.
     // The tab only changes when YOU click Answer / press the hotkey.
@@ -703,12 +593,16 @@ export default function OverlayView({
     streamingRef.current = true
     answerAccRef.current = ''
     pendingUserRef.current = user
-    armWatchdog()
-    window.api.aiAsk([
-      { role: 'system', content: buildSystemPrompt() },
-      ...historyRef.current,
-      { role: 'user', content: user }
-    ])
+    dispatchAiRequest(
+      'answer',
+      [
+        { role: 'system', content: buildSystemPrompt() },
+        ...historyRef.current,
+        { role: 'user', content: user }
+      ],
+      includeScreen,
+      handledRange
+    )
   }
 
   /**
@@ -716,9 +610,16 @@ export default function OverlayView({
    * fixes, propose follow-up questions). Routed to the Analysis pane. Analysis
    * is stateless — it is not added to the answer conversation memory.
    */
-  function streamAnalysis(user: string): void {
-    if (streamingRef.current) window.api.aiCancel()
+  function streamAnalysis(
+    user: string,
+    includeScreen = false,
+    handledRange: PendingHandledRange | null = null
+  ): void {
+    if (streamingRef.current) {
+      window.api.aiCancel(activeAiRequestIdRef.current ?? undefined)
+    }
     intentRef.current = 'analyze'
+    setActiveIntent('analyze')
     // Note: we do NOT force the active tab to 'analysis' here. Auto-analysis runs
     // continuously, and force-switching kept yanking the user off the Answer tab
     // so generated answers were never seen. Manual "Analyse" switches the tab
@@ -733,12 +634,33 @@ export default function OverlayView({
     streamingRef.current = true
     analysisAccRef.current = ''
     pendingUserRef.current = null
-    lastAnalyzedCountRef.current = finalsRef.current.length
-    armWatchdog()
-    window.api.aiAsk([
-      { role: 'system', content: buildSystemPrompt() },
-      { role: 'user', content: user }
-    ])
+    dispatchAiRequest(
+      'analyze',
+      [
+        { role: 'system', content: buildSystemPrompt() },
+        { role: 'user', content: user }
+      ],
+      includeScreen,
+      handledRange
+    )
+  }
+
+  function streamConsultant(user: string, includeScreen = screenEnabledRef.current): void {
+    if (streamingRef.current) window.api.aiCancel(activeAiRequestIdRef.current ?? undefined)
+    intentRef.current = 'consultant'
+    setActiveIntent('consultant')
+    const prev = consultantAccRef.current.trim()
+    if (prev) setConsultantHistory((h) => [...h, prev].slice(-30))
+    setConsultant('')
+    setAiError(null)
+    setStreaming(true)
+    streamingRef.current = true
+    consultantAccRef.current = ''
+    pendingUserRef.current = null
+    dispatchAiRequest('analyze', [
+      { role: 'system', content: createMeetingSystemPrompt(config, true) },
+      { role: 'user', content: `[CONSULTANT]\n${user}` }
+    ], includeScreen)
   }
 
   // Manual "Clear" for the answer / analysis panes — the only thing that empties
@@ -747,6 +669,9 @@ export default function OverlayView({
     setAnswerHistory([])
     setSuggestion('')
     answerAccRef.current = ''
+    historyRef.current = []
+    pendingUserRef.current = null
+    setAiError(null)
   }
   function clearAnalyses(): void {
     setAnalysisHistory([])
@@ -754,17 +679,29 @@ export default function OverlayView({
     analysisAccRef.current = ''
   }
 
-  function analyzeDiscussion(): void {
+  function analyzeDiscussion(includeScreen = false): void {
     if (finalsRef.current.length === 0) return
     // Only the lines that are NEW since the last analysis are what we analyse now;
     // everything before is context. This stops the analysis from re-covering
     // previous points every time.
-    const newCount = Math.max(1, finalsRef.current.length - lastAnalyzedCountRef.current)
-    const latest = recentTranscript(newCount)
+    const targetEnd = finalsRef.current.length
+    const targetStart = Math.min(lastAnalyzedCountRef.current, Math.max(0, targetEnd - 1))
+    const latest = formatTranscript(
+      finalsRef.current.slice(targetStart, targetEnd),
+      speakerNamesRef.current,
+      isMeeting
+    )
+    const earlier = formatTranscript(
+      finalsRef.current.slice(0, targetStart).slice(-16),
+      speakerNamesRef.current,
+      isMeeting
+    )
     streamAnalysis(
-      `[ANALYZE] Earlier discussion (context only — already covered, do NOT re-analyse):\n${transcriptWithHistory(16)}\n\n` +
+      `[ANALYZE] Earlier discussion (context only — already covered, do NOT re-analyse):\n${earlier || '(none)'}\n\n` +
         `THE LATEST PART TO ANALYSE NOW (new since the last analysis):\n${latest}\n\n` +
-        `Analyse ONLY this latest part using the ANALYZE format. Do not repeat analysis of the earlier context above.`
+        `Analyse ONLY this latest part using the ANALYZE format. Do not repeat analysis of the earlier context above.`,
+      includeScreen,
+      { kind: 'analysis', end: targetEnd }
     )
   }
 
@@ -805,109 +742,151 @@ export default function OverlayView({
     // Only a manual Answer action moves you to the Answer tab; auto-answer leaves
     // your current tab alone.
     if (switchTab) setActiveTab('answer')
-    // Mark this turn as answered so the next auto-answer only picks up questions
-    // asked AFTER this point (prevents re-answering the same/previous question).
-    lastAnsweredCountRef.current = finalsRef.current.length
+    const targetEnd = finalsRef.current.length
     if (isMeeting) {
       streamAnswer(
         `[ANSWER] Recent meeting discussion (context only — do NOT answer anything here):\n${transcriptWithHistory(14)}\n\n` +
           `THE QUESTION TO ANSWER NOW (the most recent thing directed at me):\n"${question}"\n\n` +
-          `Answer ONLY this most recent question, in the first person, ready to say out loud. Ignore and do not re-answer any earlier questions — use the discussion above only as background if this question refers back to it.`
+          `Answer ONLY this most recent question, in the first person, ready to say out loud. Ignore and do not re-answer any earlier questions — use the discussion above only as background if this question refers back to it.`,
+        screenEnabledRef.current,
+        { kind: 'answer', end: targetEnd }
       )
       return
     }
     streamAnswer(
       `Interview transcript (context only — do NOT answer anything here):\n${transcriptWithHistory(14)}\n\n` +
         `THE QUESTION TO ANSWER NOW (the interviewer's most recent question):\n"${question}"\n\n` +
-        `Answer ONLY this most recent question thoroughly. Do not re-answer earlier questions; use the transcript above only as background if this question refers back to it.`
+      `Answer ONLY this most recent question thoroughly. Do not re-answer earlier questions; use the transcript above only as background if this question refers back to it.`,
+      screenEnabledRef.current,
+      { kind: 'answer', end: targetEnd }
     )
+  }
+
+  function retryQueuedInterviewQuestion(): void {
+    if (isMeeting || !queuedInterviewQuestionRef.current) return
+    setTimeout(() => {
+      if (
+        isMeeting ||
+        streamingRef.current ||
+        !autoAnswerRef.current ||
+        finalsRef.current.length <= lastAnsweredCountRef.current
+      ) {
+        return
+      }
+      queuedInterviewQuestionRef.current = false
+      askAi()
+    }, 0)
   }
 
   function askManual(): void {
     const q = manualQuestion.trim()
     if (!q) return
+    if (isConsultant) {
+      setActiveTab('consultant')
+      streamConsultant(
+        `Optum technical consulting request:\n"${q}"\n\nUse the current screen if available. Give actionable Java/Spring Boot/GraphQL guidance and include exact Insomnia click steps whenever API testing is involved.`,
+        screenEnabledRef.current
+      )
+      setManualQuestion('')
+      return
+    }
     // Manual ask: this is a deliberate user action, so show the Answer tab.
     setActiveTab('answer')
-    // A manual ask handles the current moment, so don't let the auto-answer
-    // re-fire on the same transcript question right after.
-    lastAnsweredCountRef.current = finalsRef.current.length
+    const targetEnd = finalsRef.current.length
     const ctx = transcriptWithHistory(8)
     const user = isMeeting
       ? (ctx ? `[ANSWER] Recent meeting discussion (context):\n${ctx}\n\n` : '[ANSWER] ') +
         `Answer this for me, in the first person, ready to say out loud:\n"${q}"`
       : (ctx ? `Recent conversation (context):\n${ctx}\n\n` : '') +
         `The interviewer asked:\n"${q}"\n\nGive me the best answer to say out loud.`
-    streamAnswer(user)
+    streamAnswer(user, screenEnabledRef.current, { kind: 'answer', end: targetEnd })
     setManualQuestion('')
+  }
+  function clearConsultant(): void {
+    setConsultantHistory([])
+    setConsultant('')
+    consultantAccRef.current = ''
+  }
+
+  function consultScreen(): void {
+    if (!screenEnabledRef.current || !screenReadyRef.current) {
+      setScreenError('Turn Screen on before listening, then start capture again.')
+      return
+    }
+    setActiveTab('consultant')
+    streamConsultant(
+      `Review the current screen and recent transcript as a senior Java/GraphQL architect. Detect whether this is a user story, coding problem, API/schema design, existing code, error, or architecture discussion. Break down exactly what must be built, include concrete GraphQL request/response payloads and consistent Java/Spring Boot code where applicable, and explain the reasoning and delivery steps.\n\nRecent discussion:\n${transcriptWithHistory(14) || '(No transcript yet; use the screen.)'}`,
+      true
+    )
+  }
+
+  function analyzeScreen(): void {
+    if (!screenEnabledRef.current || !screenReadyRef.current) {
+      setScreenError('Turn Screen on before listening, then start capture again.')
+      return
+    }
+    if (isConsultant) {
+      consultScreen()
+    } else if (isMeeting) {
+      setActiveTab('analysis')
+      streamAnalysis(
+        '[ANALYZE] Examine the attached current screen together with the latest meeting transcript. Explain what is visible, identify the important point, risk, error, or decision, and suggest the most useful contribution or next step.',
+        true
+      )
+    } else {
+      setActiveTab('answer')
+      streamAnswer(
+        'Examine the attached current screen together with the recent interview transcript. Identify the visible question, code, diagram, error, or task and give me the concise, accurate response I should say or the solution I should explain.'
+      )
+    }
   }
 
   function cancelAi(): void {
     clearWatchdog()
-    window.api.aiCancel()
+    window.api.aiCancel(activeAiRequestIdRef.current ?? undefined)
+    activeAiRequestIdRef.current = null
+    activeHandledRangeRef.current = null
     setStreaming(false)
     streamingRef.current = false
     pendingUserRef.current = null
+    queuedInterviewQuestionRef.current = false
   }
 
   // --- Minutes of Meeting ---------------------------------------------------
-  // System prompt that turns the raw transcript into structured, professional
-  // meeting minutes. Grounded in the session's project/stack context so garbled
-  // technical terms are corrected and nothing is invented.
-  function buildMinutesPrompt(): string {
-    const role = config?.role?.trim()
-    const project = config?.projectContext?.trim()
-    const stack = config?.techStack?.trim()
-    const docs = config?.docsText?.trim()
-    return [
-      'You are an expert meeting secretary. Produce accurate, professional Minutes of Meeting (MoM) from the raw speech-to-text transcript provided.',
-      'The transcript is machine-generated and will contain recognition errors, especially for technical and product terms — silently correct them to the intended canonical terms using the project context and tech stack below (for example "ring board" means "Spring Boot", "power gres" means "PostgreSQL", "jason" means "JSON").',
-      'Output ONLY the minutes in clean Markdown — no preamble and no closing remarks. Use these sections in order, and omit any section that has nothing substantive:',
-      '# Minutes of Meeting',
-      '**Attendees:** the participants, using the speaker names/labels that appear in the transcript.',
-      '## Summary',
-      'A short paragraph (3-5 sentences) capturing the purpose and outcome of the meeting.',
-      '## Key Discussion Points',
-      'Concise bullets of the main topics discussed and the important details of each.',
-      '## Decisions Made',
-      'Each concrete decision that was agreed, as a bullet.',
-      '## Action Items',
-      'A checklist in the form "- [ ] Task — Owner (due date if mentioned)". Only include real tasks that were actually assigned or agreed.',
-      '## Open Questions / Follow-ups',
-      'Any unresolved questions or items to revisit.',
-      'Be strictly faithful to what was actually said — never invent decisions, owners, dates, numbers, or facts that are not in the transcript. Skip greetings, small talk, and filler.',
-      role ? `Host role context: ${role}.` : '',
-      project ? `Project / application context:\n${project}` : '',
-      stack ? `Tech stack: ${stack}.` : '',
-      docs ? `Reference docs:\n${docs}` : ''
-    ]
-      .filter(Boolean)
-      .join('\n')
-  }
-
   // Called by the "End & Minutes" button. Stops capture, then asks the LLM to
   // turn the entire transcript (every finalised line) into minutes, streamed
   // into the minutes modal.
-  function generateMinutes(): void {
+  async function generateMinutes(): Promise<void> {
     setMinutesError(null)
+    setMinutesNotice(null)
     setMinutesOpen(true)
-    if (finalsRef.current.length === 0) {
+    if (captureStateRef.current !== 'idle') {
+      setMinutesPreparing(true)
+      await pauseCapture()
+      setMinutesPreparing(false)
+    }
+    const snapshot = mergeTranscriptForMinutes(finalsRef.current, interimRef.current)
+    if (snapshot.length === 0) {
       setMinutes('')
       setMinutesError('No transcript yet — start listening and capture the meeting first.')
       return
     }
-    if (capturing) stopCapture()
-    if (streamingRef.current) window.api.aiCancel()
+    updateFinals(snapshot)
+    updateInterim({ interviewer: '', you: '' })
+    if (streamingRef.current) {
+      window.api.aiCancel(activeAiRequestIdRef.current ?? undefined)
+      activeHandledRangeRef.current = null
+    }
     intentRef.current = 'minutes'
+    setActiveIntent('minutes')
     minutesAccRef.current = ''
     setMinutes('')
     setStreaming(true)
     streamingRef.current = true
     pendingUserRef.current = null
-    armWatchdog()
-    // finals holds every line ever transcribed, so this is the complete meeting.
-    const full = recentTranscript(finalsRef.current.length)
-    window.api.aiAsk([
-      { role: 'system', content: buildMinutesPrompt() },
+    const full = formatTranscript(snapshot, speakerNamesRef.current, isMeeting)
+    dispatchAiRequest('minutes', [
+      { role: 'system', content: createMinutesPrompt(config) },
       {
         role: 'user',
         content: `Here is the full meeting transcript:\n\n${full}\n\nGenerate the Minutes of Meeting now, following the required format.`
@@ -924,14 +903,14 @@ export default function OverlayView({
     try {
       ok = await window.api.copyText(text)
     } catch {
-      ok = false
+      // Use the browser clipboard fallback below.
     }
     if (!ok) {
       try {
         await navigator.clipboard.writeText(text)
         ok = true
       } catch {
-        ok = false
+        return
       }
     }
     if (ok) {
@@ -946,23 +925,52 @@ export default function OverlayView({
   }, [])
 
   useEffect(() => {
-    const offToken = window.api.onAiToken((t) => {
-      armWatchdog()
+    const offToken = window.api.onAiToken(({ requestId, text }) => {
+      if (activeAiRequestIdRef.current !== requestId) return
+      armWatchdog(requestId)
       if (intentRef.current === 'summarize') {
         // Background memory update — accumulate silently, never touch the UI.
-        summaryAccRef.current += t
+        summaryAccRef.current += text
       } else if (intentRef.current === 'minutes') {
-        minutesAccRef.current += t
-        setMinutes((prev) => prev + t)
+        minutesAccRef.current += text
+        setMinutes((prev) => prev + text)
       } else if (intentRef.current === 'analyze') {
-        analysisAccRef.current += t
-        setAnalysis((prev) => prev + t)
+        analysisAccRef.current += text
+        setAnalysis((prev) => prev + text)
+      } else if (intentRef.current === 'consultant') {
+        consultantAccRef.current += text
+        setConsultant((prev) => prev + text)
       } else {
-        answerAccRef.current += t
-        setSuggestion((prev) => prev + t)
+        answerAccRef.current += text
+        setSuggestion((prev) => prev + text)
       }
     })
-    const offDone = window.api.onAiDone(() => {
+    const offDone = window.api.onAiDone(({ requestId }) => {
+      if (activeAiRequestIdRef.current !== requestId) return
+      const handledRange = activeHandledRangeRef.current
+      const output =
+        intentRef.current === 'answer'
+          ? answerAccRef.current
+          : intentRef.current === 'analyze'
+            ? analysisAccRef.current
+            : intentRef.current === 'consultant'
+              ? consultantAccRef.current
+              : intentRef.current === 'minutes'
+                ? minutesAccRef.current
+                : summaryAccRef.current
+      if (
+        handledRange &&
+        activeAiSessionRef.current === sessionGenerationRef.current &&
+        shouldMarkAiRangeHandled('done', output)
+      ) {
+        if (handledRange.kind === 'answer') {
+          lastAnsweredCountRef.current = Math.max(lastAnsweredCountRef.current, handledRange.end)
+        } else {
+          lastAnalyzedCountRef.current = Math.max(lastAnalyzedCountRef.current, handledRange.end)
+        }
+      }
+      activeAiRequestIdRef.current = null
+      activeHandledRangeRef.current = null
       clearWatchdog()
       setStreaming(false)
       streamingRef.current = false
@@ -988,10 +996,14 @@ export default function OverlayView({
         }
       }
       pendingUserRef.current = null
+      retryQueuedInterviewQuestion()
       // Now that the stream is idle, fold any backlog of older lines into memory.
       setTimeout(() => maybeSummarize(), 0)
     })
-    const offErr = window.api.onAiError((m) => {
+    const offErr = window.api.onAiError(({ requestId, message }) => {
+      if (activeAiRequestIdRef.current !== requestId) return
+      activeAiRequestIdRef.current = null
+      activeHandledRangeRef.current = null
       clearWatchdog()
       // A failed background summarise must stay silent — keep the old summary and
       // retry later rather than showing an error over the transcript.
@@ -1000,22 +1012,26 @@ export default function OverlayView({
         streamingRef.current = false
         summaryAccRef.current = ''
         pendingUserRef.current = null
+        retryQueuedInterviewQuestion()
         return
       }
       // A failed minutes generation is shown inside the minutes modal.
       if (intentRef.current === 'minutes') {
-        setMinutesError(m)
+        setMinutesError(message)
         setStreaming(false)
         streamingRef.current = false
         minutesAccRef.current = ''
         pendingUserRef.current = null
         return
       }
-      setAiError(m)
+      setAiError(message)
       setStreaming(false)
       streamingRef.current = false
       pendingUserRef.current = null
       answerAccRef.current = ''
+      analysisAccRef.current = ''
+      consultantAccRef.current = ''
+      retryQueuedInterviewQuestion()
     })
     return () => {
       offToken()
@@ -1048,11 +1064,9 @@ export default function OverlayView({
       // autoAnswer. Track whether this turn should be ANSWERED (draft a reply for
       // me to say) vs just analysed. We answer when auto-answer is on and either
       // the utterance is clearly aimed at me (my name / "what do you think")
-      // OR it simply looks like a question — otherwise most normal questions were
-      // never being answered and everything fell through to analysis only.
-      const directed =
-        autoAnswerRef.current &&
-        (isDirectedAtMe(last.text, config?.userName) || looksLikeQuestion(last.text))
+      // A general question between other participants belongs in analysis. Draft
+      // an answer only for clear name/second-person cues aimed at this user.
+      const directed = autoAnswerRef.current && isDirectedAtMe(last.text, config?.userName)
       if (directed) turnDirectedRef.current = true
       // Debounce: (re)arm the "they've stopped talking" pause timer. Use a
       // shorter wait when a question is aimed at me so I get an answer faster.
@@ -1064,7 +1078,6 @@ export default function OverlayView({
       if (!maxWaitTimerRef.current) {
         maxWaitTimerRef.current = setTimeout(fireMeetingAuto, AUTO_MAX_WAIT_MS)
       }
-      // eslint-disable-next-line react-hooks/exhaustive-deps
       return
     }
 
@@ -1079,10 +1092,18 @@ export default function OverlayView({
       autoTimerRef.current = null
       const ask = turnHasQuestionRef.current
       turnHasQuestionRef.current = false // the turn is over either way
-      // One answer per turn; never cut off an answer that's already streaming.
-      if (!ask || !autoAnswerRef.current || streamingRef.current) return
+      if (!ask || !autoAnswerRef.current) return
+      // Preserve a question that reaches the end of its turn while another
+      // response is streaming. Completion/error will retry it against the latest
+      // transcript instead of silently discarding it.
+      if (streamingRef.current) {
+        queuedInterviewQuestionRef.current = true
+        return
+      }
       askAi()
     }, AUTO_SILENCE_MS)
+    // This effect intentionally reacts only to committed transcript changes;
+    // helpers read current values from refs to avoid resetting its timers.
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [finals])
 
@@ -1103,10 +1124,12 @@ export default function OverlayView({
       const t = interimRef.current[src]?.trim()
       if (!t || hasProvisionalRef.current[src]) return
       hasProvisionalRef.current[src] = true
-      setFinals((prev) => [...prev, { source: src, text: t, provisional: true }])
-      setInterim((prev) => ({ ...prev, [src]: '' }))
+      updateFinals((prev) => [...prev, { source: src, text: t, provisional: true }])
+      updateInterim((prev) => ({ ...prev, [src]: '' }))
     }
     const offT = window.api.onTranscript(({ source, text, isFinal, speaker, confidence }) => {
+      if (!acceptingTranscriptsRef.current) return
+      lastTranscriptEventAtRef.current = Date.now()
       const kind: AudioSourceKind = source === 'interviewer' ? 'system' : 'mic'
       // Sarvam sends no confidence (its finals are undefined) and does its own
       // server-side VAD, so it needs a wider local window; confidence-bearing
@@ -1120,6 +1143,7 @@ export default function OverlayView({
       const conf = typeof confidence === 'number' ? confidence : undefined
       const lowConfidence = conf !== undefined && conf < MIN_CONFIDENCE
       if (isFinal) {
+        lastFinalTranscriptAtRef.current[kind] = Date.now()
         // A final ends the current utterance, so cancel any pending promote timer.
         clearPromote(source)
         // Decide whether to keep this finalised line.
@@ -1141,19 +1165,19 @@ export default function OverlayView({
           // committed line rather than erasing it; only clear the gray preview.
           if (hasProvisionalRef.current[source]) {
             hasProvisionalRef.current[source] = false
-            setFinals((prev) =>
+            updateFinals((prev) =>
               prev.map((l) =>
                 l.provisional && l.source === source ? { ...l, provisional: false } : l
               )
             )
           }
-          setInterim((prev) => ({ ...prev, [source]: '' }))
+          updateInterim((prev) => ({ ...prev, [source]: '' }))
           return
         }
         // Accepted final: if we committed this utterance early, replace that
         // provisional line in place (now with the accurate text + speaker label);
         // otherwise append a new line. This is what prevents duplicates.
-        setFinals((prev) => {
+        updateFinals((prev) => {
           const idx = prev.findIndex((l) => l.provisional && l.source === source)
           if (idx !== -1) {
             const next = prev.slice()
@@ -1163,7 +1187,7 @@ export default function OverlayView({
           return [...prev, { source, text, speaker }]
         })
         hasProvisionalRef.current[source] = false
-        setInterim((prev) => ({ ...prev, [source]: '' }))
+        updateInterim((prev) => ({ ...prev, [source]: '' }))
       } else if (heardVoice || conf !== undefined) {
         // Live preview (interim). Deepgram sends a confidence with every partial
         // and its own professional VAD already decided this is speech — so show
@@ -1171,11 +1195,11 @@ export default function OverlayView({
         if (hasProvisionalRef.current[source]) {
           // This utterance was already committed early: keep refining that line
           // in place instead of showing a separate gray preview below it.
-          setFinals((prev) =>
+          updateFinals((prev) =>
             prev.map((l) => (l.provisional && l.source === source ? { ...l, text } : l))
           )
         } else {
-          setInterim((prev) => ({ ...prev, [source]: text }))
+          updateInterim((prev) => ({ ...prev, [source]: text }))
           // Arm a one-shot timer (only when a fresh preview starts) so a preview
           // that never finalises — non-stop / overlapping speech — is committed
           // within INTERIM_PROMOTE_MS instead of waiting for a silence.
@@ -1185,8 +1209,12 @@ export default function OverlayView({
         }
       }
     })
-    const offS = window.api.onTranscriptStatus(({ status, message }) => {
-      setDgStatus(message ? `${status}: ${message}` : status)
+    const offS = window.api.onTranscriptStatus(({ source, status, message }) => {
+      if (!acceptingTranscriptsRef.current && captureStateRef.current === 'idle') return
+      setStatusBySource((previous) => ({
+        ...previous,
+        [source]: message ? `${status}: ${message}` : status
+      }))
     })
     return () => {
       offT()
@@ -1200,11 +1228,6 @@ export default function OverlayView({
     window.api.getStealth().then(setStealth)
   }, [])
 
-  useEffect(() => {
-    const el = transcriptRef.current
-    if (el) el.scrollTop = el.scrollHeight
-  }, [finals, interim])
-
   function toggleStealth(): void {
     setStealth((prev) => {
       const next = !prev
@@ -1215,10 +1238,19 @@ export default function OverlayView({
 
   useEffect(() => {
     return () => {
-      captureRef.current?.stop()
+      captureAttemptRef.current += 1
+      acceptingTranscriptsRef.current = false
+      const capture = captureRef.current
+      captureRef.current = null
+      capture?.stop()
       window.api.audioStop()
+      const aiRequestId = activeAiRequestIdRef.current
+      activeAiRequestIdRef.current = null
+      if (aiRequestId) window.api.aiCancel(aiRequestId)
+      clearWatchdog()
       if (autoTimerRef.current) clearTimeout(autoTimerRef.current)
       if (maxWaitTimerRef.current) clearTimeout(maxWaitTimerRef.current)
+      if (meterTimerRef.current) clearTimeout(meterTimerRef.current)
     }
   }, [])
 
@@ -1233,45 +1265,78 @@ export default function OverlayView({
     }
   }
 
-  // Build Deepgram keyterms from the session so domain jargon (tech stack,
-  // product/feature names) is recognised accurately instead of misheard. We take
-  // the tech stack plus multi-word / capitalised / dotted terms from the project
-  // context (e.g. "OAuth", "PostgreSQL", "login page"), de-duplicated and capped.
-  function buildKeyterms(): string[] {
-    const terms = new Set<string>(DEFAULT_TECH_KEYTERMS)
-    const addList = (s?: string): void => {
-      for (const part of (s ?? '').split(/[,;\n/|]+/)) {
-        const t = part.trim()
-        if (t.length >= 2 && t.length <= 40) terms.add(t)
+  async function refreshDisplaySources(): Promise<DisplaySourceInfo[]> {
+    setLoadingDisplaySources(true)
+    try {
+      const sources = await window.api.listDisplaySources()
+      setDisplaySources(sources)
+      const current = selectedDisplaySourceIdRef.current
+      const selected = sources.some((source) => source.id === current)
+        ? current
+        : (sources.find((source) => source.isSelected)?.id ?? sources[0]?.id ?? '')
+      selectedDisplaySourceIdRef.current = selected
+      setSelectedDisplaySourceId(selected)
+      if (sources.length === 0) {
+        setScreenError('No displays are available to capture. Check Windows screen-capture permissions.')
       }
+      return sources
+    } catch (error) {
+      setScreenError(`Could not list screens: ${(error as Error).message}`)
+      return []
+    } finally {
+      setLoadingDisplaySources(false)
     }
-    addList(config?.techStack)
-    const ctx = config?.projectContext ?? ''
-    // Capture 1-3 word Capitalised phrases ("Spring Boot", "React Native"),
-    // CamelCase ("PostgreSQL"), and dotted tech tokens ("node.js") as single
-    // keyterms — feeding the whole phrase is what makes Deepgram recognise it.
-    const phrase = /\b([A-Z][a-zA-Z0-9.+#]*(?:\s+[A-Z][a-zA-Z0-9.+#]*){0,2})\b/g
-    const dotted = /\b([a-zA-Z]+(?:\.[a-zA-Z]+)+)\b/g
-    for (const re of [phrase, dotted]) {
-      for (const m of ctx.match(re) ?? []) {
-        const t = m.trim()
-        if (t.length >= 2 && t.length <= 40) terms.add(t)
-      }
+  }
+
+  async function prepareDisplaySource(): Promise<boolean> {
+    if (!screenEnabledRef.current) return true
+    // Re-enumerate at each start so dock/monitor reconnects cannot leave a stale
+    // source id that makes screen-aware capture silently fall back or fail.
+    const sources = await refreshDisplaySources()
+    const selected = sources.some((source) => source.id === selectedDisplaySourceIdRef.current)
+      ? selectedDisplaySourceIdRef.current
+      : sources[0]?.id
+    if (!selected) {
+      setScreenError('Choose a display before starting screen-aware capture.')
+      return false
     }
-    if (config?.role) terms.add(config.role)
-    return [...terms].slice(0, 80)
+    try {
+      await window.api.selectDisplaySource(selected)
+      selectedDisplaySourceIdRef.current = selected
+      setSelectedDisplaySourceId(selected)
+      return true
+    } catch (error) {
+      setScreenError(`Could not select that screen: ${(error as Error).message}`)
+      return false
+    }
+  }
+
+  function queueMeterLevel(kind: AudioSourceKind, level: number): void {
+    pendingLevelsRef.current[kind] = level
+    if (meterTimerRef.current) return
+    meterTimerRef.current = setTimeout(() => {
+      meterTimerRef.current = null
+      setLevels({ ...pendingLevelsRef.current })
+    }, 120)
   }
 
   async function startCapture(): Promise<void> {
+    if (captureRef.current || captureStateRef.current !== 'idle') return
+    const attempt = ++captureAttemptRef.current
+    updateCaptureState('starting')
     setAudioError(null)
-    setFinals([])
-    setInterim({ interviewer: '', you: '' })
-    setDgStatus('')
-    setSpeakerNames({})
-    setAnswerHistory([])
-    setAnalysisHistory([])
-    lastAnalyzedCountRef.current = 0
-    lastAnsweredCountRef.current = 0
+    setScreenError(null)
+    setScreenReady(false)
+    screenReadyRef.current = false
+    setLastScreenSentAt(null)
+    setStatusBySource({ interviewer: '', you: '' })
+    if (!(await prepareDisplaySource())) {
+      updateCaptureState('idle')
+      return
+    }
+    if (attempt !== captureAttemptRef.current) return
+    acceptingTranscriptsRef.current = true
+    lastTranscriptEventAtRef.current = 0
     hasProvisionalRef.current = { interviewer: false, you: false }
     if (promoteTimerRef.current.interviewer) clearTimeout(promoteTimerRef.current.interviewer)
     if (promoteTimerRef.current.you) clearTimeout(promoteTimerRef.current.you)
@@ -1280,38 +1345,71 @@ export default function OverlayView({
       system: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 },
       mic: { floor: SPEECH_RMS_MIN, lastVoiceTs: 0 }
     }
+    lastFinalTranscriptAtRef.current = { system: 0, mic: 0 }
     const capture = new AudioCapture({
       onLevel: (kind, level) => {
         registerLevel(kind, level)
-        setLevels((prev) => ({ ...prev, [kind]: level }))
+        queueMeterLevel(kind, level)
       },
       onChunk: (kind, pcm) => window.api.sendAudioChunk(kind, pcm.buffer as ArrayBuffer),
-      onError: (kind, err) => setAudioError(`${kind}: ${err.message}`)
+      onError: (kind, err) => {
+        setAudioError(`${kind}: ${err.message}`)
+        if (captureRef.current === capture && kind === 'system' && /ended$/i.test(err.message)) {
+          void pauseCapture()
+        } else if (kind === 'mic' && /ended$/i.test(err.message)) {
+          window.api.audioSetMic(false)
+          setMicEnabled(false)
+        }
+      }
     })
     captureRef.current = capture
-    window.api.audioStart(micEnabled, provider, buildKeyterms())
-    setCapturing(true)
+    window.api.audioStart(
+      false,
+      provider,
+      buildSpeechKeyterms(config, { meeting: isMeeting, consultant: isConsultant })
+    )
     try {
-      await capture.startSystem()
+      const ready = await capture.startSystem(screenEnabled)
+      if (attempt !== captureAttemptRef.current) {
+        capture.stop()
+        return
+      }
+      setScreenReady(ready)
+      screenReadyRef.current = ready
+      if (screenEnabled && !ready) {
+        setScreenError('System audio is active, but a screen frame could not be prepared.')
+      }
     } catch (err) {
+      if (attempt !== captureAttemptRef.current || (err as Error).name === 'AbortError') return
       setAudioError(`System audio: ${(err as Error).message}`)
+      if (screenEnabledRef.current) {
+        setScreenError(
+          `Screen capture failed: ${(err as Error).message}. Re-select the display; protected or DRM content may not be capturable.`
+        )
+      }
+      capture.stop()
+      captureRef.current = null
+      acceptingTranscriptsRef.current = false
+      window.api.audioStop()
+      updateCaptureState('idle')
+      return
     }
+    updateCaptureState('active')
     if (micEnabled) {
       try {
         await capture.startMic()
+        if (attempt !== captureAttemptRef.current) return
+        window.api.audioSetMic(true)
       } catch (err) {
+        if (attempt !== captureAttemptRef.current || (err as Error).name === 'AbortError') return
+        window.api.audioSetMic(false)
+        setMicEnabled(false)
         setAudioError(`Mic: ${(err as Error).message}`)
       }
     }
   }
 
-  function stopCapture(): void {
-    captureRef.current?.stop()
-    captureRef.current = null
-    window.api.audioStop()
-    setCapturing(false)
-    setLevels({ system: 0, mic: 0 })
-    // Cancel any pending auto-response timers so they can't fire after we stop.
+  function clearCaptureTimers(): void {
     if (autoTimerRef.current) {
       clearTimeout(autoTimerRef.current)
       autoTimerRef.current = null
@@ -1320,11 +1418,165 @@ export default function OverlayView({
       clearTimeout(maxWaitTimerRef.current)
       maxWaitTimerRef.current = null
     }
+    turnHasQuestionRef.current = false
+    turnDirectedRef.current = false
+  }
+
+  async function waitForTranscriptSettled(maxWaitMs = 1400, quietMs = 220): Promise<void> {
+    const deadline = Date.now() + maxWaitMs
+    while (Date.now() < deadline) {
+      await new Promise<void>((resolve) => setTimeout(resolve, 50))
+      if (Date.now() - lastTranscriptEventAtRef.current >= quietMs) break
+    }
+    await new Promise<void>((resolve) => requestAnimationFrame(() => resolve()))
+  }
+
+  async function pauseCapture(): Promise<void> {
+    if (captureStateRef.current === 'idle' || captureStateRef.current === 'finalizing') return
+    const wasStarting = captureStateRef.current === 'starting'
+    const capture = captureRef.current
+    captureAttemptRef.current += 1
+    clearCaptureTimers()
+
+    if (wasStarting) {
+      acceptingTranscriptsRef.current = false
+      captureRef.current = null
+      capture?.stop()
+      window.api.audioStop()
+    } else {
+      updateCaptureState('finalizing')
+      let localFlushFailed = false
+      try {
+        if (capture) await capture.flush()
+      } catch (error) {
+        localFlushFailed = true
+        setAudioError(`Could not flush the local audio tail: ${(error as Error).message}`)
+      } finally {
+        // Stop producing PCM before asking the provider to finalize. Otherwise
+        // another segment can arrive after its flush marker and be dropped.
+        captureRef.current = null
+        capture?.stop()
+      }
+      // Flushing the worklet can emit its final sub-100 ms PCM chunk. Inspect VAD
+      // only after that acknowledgement so a speech-only tail gets the full ASR
+      // finalization window instead of the short quiet-stop path.
+      const hadPendingTail = Boolean(
+        interimRef.current.interviewer.trim() ||
+          interimRef.current.you.trim() ||
+          finalsRef.current.some((line) => line.provisional) ||
+          vadRef.current.system.lastVoiceTs > lastFinalTranscriptAtRef.current.system ||
+          vadRef.current.mic.lastVoiceTs > lastFinalTranscriptAtRef.current.mic
+      )
+      if (localFlushFailed && hadPendingTail) {
+        setMinutesNotice(
+          'The local audio tail could not be fully flushed; pending words were included on a best-effort basis.'
+        )
+      }
+      try {
+        const result = await window.api.audioStopGracefully(hadPendingTail ? 1800 : 400)
+        if (result.timedOut && hadPendingTail) {
+          setMinutesNotice('ASR finalization timed out; the last interim words were included on a best-effort basis.')
+        }
+      } catch (error) {
+        setAudioError(`Could not fully finalize audio: ${(error as Error).message}`)
+        setMinutesNotice('The audio service could not confirm finalization; the last interim words were included on a best-effort basis.')
+        window.api.audioStop()
+      }
+      await waitForTranscriptSettled()
+      const merged = mergeTranscriptForMinutes(finalsRef.current, interimRef.current)
+      updateFinals(merged)
+      updateInterim({ interviewer: '', you: '' })
+      acceptingTranscriptsRef.current = false
+    }
+
+    updateCaptureState('idle')
+    setScreenReady(false)
+    screenReadyRef.current = false
+    pendingLevelsRef.current = { system: 0, mic: 0 }
+    setLevels({ system: 0, mic: 0 })
+    if (meterTimerRef.current) {
+      clearTimeout(meterTimerRef.current)
+      meterTimerRef.current = null
+    }
+  }
+
+  async function resetSession(): Promise<void> {
+    if (captureStateRef.current !== 'idle') await pauseCapture()
+    sessionGenerationRef.current += 1
+    captureAttemptRef.current += 1
+    acceptingTranscriptsRef.current = false
+    lastTranscriptEventAtRef.current = 0
+    lastFinalTranscriptAtRef.current = { system: 0, mic: 0 }
+    clearCaptureTimers()
+    const requestId = activeAiRequestIdRef.current
+    if (requestId) window.api.aiCancel(requestId)
+    activeAiRequestIdRef.current = null
+    activeHandledRangeRef.current = null
+    activeAiSessionRef.current = sessionGenerationRef.current
+    clearWatchdog()
+    streamingRef.current = false
+    setStreaming(false)
+
+    const clean = createSessionTrackingState()
+    lastAnalyzedCountRef.current = clean.lastAnalyzedCount
+    lastAnsweredCountRef.current = clean.lastAnsweredCount
+    summarizedUptoRef.current = clean.summarizedUpto
+    summarizeTargetRef.current = clean.summarizeTarget
+    turnHasQuestionRef.current = clean.turnHasQuestion
+    turnDirectedRef.current = clean.turnDirected
+    queuedInterviewQuestionRef.current = clean.queuedInterviewQuestion
+    meetingSummaryRef.current = clean.meetingSummary
+    summaryAccRef.current = clean.summaryAccumulator
+    answerAccRef.current = clean.answerAccumulator
+    analysisAccRef.current = clean.analysisAccumulator
+    consultantAccRef.current = clean.consultantAccumulator
+    minutesAccRef.current = clean.minutesAccumulator
+    historyRef.current = []
+    pendingUserRef.current = null
+    hasProvisionalRef.current = { interviewer: false, you: false }
+    for (const source of ['interviewer', 'you'] as const) {
+      const timer = promoteTimerRef.current[source]
+      if (timer) clearTimeout(timer)
+    }
+    promoteTimerRef.current = { interviewer: null, you: null }
+
+    updateFinals([])
+    updateInterim({ interviewer: '', you: '' })
+    setStatusBySource({ interviewer: '', you: '' })
+    speakerNamesRef.current = {}
+    setSpeakerNames({})
+    setAnswerHistory([])
+    setAnalysisHistory([])
+    setConsultantHistory([])
+    setSuggestion('')
+    setAnalysis('')
+    setConsultant('')
+    setMinutes('')
+    setMinutesOpen(false)
+    setMinutesError(null)
+    setMinutesNotice(null)
+    setMinutesPreparing(false)
+    setMinutesCopied(false)
+    setAiError(null)
+    setAudioError(null)
+    setManualQuestion('')
+    setSeconds({ system: 0, mic: 0 })
+    setLevels({ system: 0, mic: 0 })
+    setLastScreenSentAt(null)
+    setScreenReady(false)
+    screenReadyRef.current = false
+    setScreenError(null)
+    intentRef.current = 'answer'
+    setActiveIntent('answer')
+    setActiveTab(isConsultant ? 'consultant' : isMeeting ? 'analysis' : 'answer')
   }
 
   useEffect(() => {
     const off = window.api.onHotkey((payload) => {
-      if (payload.action === 'ask') askAi(true)
+      if (payload.action === 'ask') {
+        if (finalsRef.current.length === 0 && screenReadyRef.current) analyzeScreen()
+        else askAi(true)
+      }
     })
     return off
     // eslint-disable-next-line react-hooks/exhaustive-deps
@@ -1336,10 +1588,28 @@ export default function OverlayView({
       <div className="drag flex items-center justify-between px-4 py-2.5">
         <div className="flex items-center gap-2">
           <span className="relative flex h-2.5 w-2.5">
-            <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
-            <span className="relative inline-flex h-2.5 w-2.5 rounded-full bg-emerald-400" />
+            {capturing && (
+              <span className="absolute inline-flex h-full w-full animate-ping rounded-full bg-emerald-400 opacity-60" />
+            )}
+            <span
+              className={`relative inline-flex h-2.5 w-2.5 rounded-full ${
+                capturing
+                  ? 'bg-emerald-400'
+                  : captureState === 'starting' || captureState === 'finalizing'
+                    ? 'bg-amber-400'
+                    : 'bg-zinc-500'
+              }`}
+            />
           </span>
-          <span className="text-sm font-semibold text-zinc-100">Live</span>
+          <span className="text-sm font-semibold text-zinc-100">
+            {capturing
+              ? 'Live'
+              : captureState === 'starting'
+                ? 'Starting'
+                : captureState === 'finalizing'
+                  ? 'Finalizing'
+                  : 'Idle'}
+          </span>
           {config?.role ? <span className="text-xs text-zinc-500">· {config.role}</span> : null}
         </div>
         <div className="no-drag flex items-center gap-1">
@@ -1375,118 +1645,57 @@ export default function OverlayView({
         </div>
       </div>
 
-      {/* Capture controls + level meters (Phase 2) */}
-      <div className="no-drag mx-3 mb-2 rounded-xl border border-white/10 bg-black/20 p-2.5">
-        <div className="mb-2 flex items-center gap-2">
-          <button
-            onClick={capturing ? stopCapture : startCapture}
-            className={`rounded-md px-3 py-1 text-xs font-semibold text-white ${
-              capturing ? 'bg-red-500/80 hover:bg-red-500' : 'bg-emerald-500/90 hover:bg-emerald-400'
-            }`}
-          >
-            {capturing ? 'Stop listening' : 'Start listening'}
-          </button>
-          <button
-            onClick={generateMinutes}
-            disabled={streaming && intentRef.current === 'minutes'}
-            title="End the meeting and generate the Minutes of Meeting from the full transcript"
-            className="rounded-md bg-amber-500/90 px-3 py-1 text-xs font-semibold text-white hover:bg-amber-400 disabled:opacity-40"
-          >
-            {capturing ? 'End & Minutes' : 'Minutes of Meeting'}
-          </button>
-          <button
-            onClick={() => setMicEnabled((v) => !v)}
-            disabled={capturing}
-            className={`rounded-md px-2 py-1 text-xs ${
-              micEnabled ? 'bg-white/15 text-zinc-100' : 'bg-white/5 text-zinc-500'
-            } disabled:opacity-50`}
-          >
-            Mic {micEnabled ? 'on' : 'off'}
-          </button>
-          <select
-            value={provider}
-            onChange={(e) => setProvider(e.target.value as Provider)}
-            disabled={capturing}
-            title="Choose the speech engine. Deepgram handles all English accents (American, British/UK, Indian and other native accents) and labels each speaker; Sarvam's only English model is Indian-accent tuned and can't separate speakers."
-            className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 focus:border-indigo-400/50 focus:outline-none disabled:opacity-50"
-          >
-            <option value="deepgram">Deepgram · English + labels</option>
-            <option value="sarvam">Sarvam · Indian English</option>
-            <option value="auto">Auto (Sarvam + fallback)</option>
-          </select>
-          {audioError && (
-            <span className="truncate text-[10px] text-red-300" title={audioError}>
-              {audioError}
-            </span>
-          )}
-        </div>
-        <div className="flex items-center gap-3">
-          <Meter
-            label={isMeeting ? 'Meeting (system)' : 'Interviewer (system)'}
-            level={levels.system}
-            seconds={seconds.system}
-            active={capturing}
-          />
-          {micEnabled && (
-            <Meter label="You (mic)" level={levels.mic} seconds={seconds.mic} active={capturing} />
-          )}
-        </div>
-      </div>
+      <CaptureControls
+        captureState={captureState}
+        transcriptLineCount={finals.length}
+        hasSessionContent={Boolean(finals.length || suggestion || analysis || consultant)}
+        isMeeting={isMeeting}
+        micEnabled={micEnabled}
+        screenEnabled={screenEnabled}
+        provider={provider}
+        audioError={audioError}
+        levels={levels}
+        seconds={seconds}
+        displaySources={displaySources}
+        selectedDisplaySourceId={selectedDisplaySourceId}
+        loadingDisplaySources={loadingDisplaySources}
+        screenError={screenError}
+        screenReady={screenReady}
+        lastScreenSentAt={lastScreenSentAt}
+        generatingMinutes={streaming && activeIntent === 'minutes'}
+        onStartOrPause={() => (captureBusy ? void pauseCapture() : void startCapture())}
+        onNewSession={() => void resetSession()}
+        onGenerateMinutes={() => void generateMinutes()}
+        onToggleMic={() => setMicEnabled((value) => !value)}
+        onToggleScreen={() => {
+          const next = !screenEnabledRef.current
+          screenEnabledRef.current = next
+          setScreenEnabled(next)
+          setScreenError(null)
+          if (next) void refreshDisplaySources()
+        }}
+        onProviderChange={setProvider}
+        onSelectDisplaySource={(id) => {
+          selectedDisplaySourceIdRef.current = id
+          setSelectedDisplaySourceId(id)
+          setScreenError(null)
+        }}
+        onRefreshDisplaySources={() => void refreshDisplaySources()}
+      />
 
-      {/* Transcript pane */}
-      <div className="no-drag mx-3 mb-2 flex-1 overflow-hidden rounded-xl border border-white/10 bg-black/30">
-        <div className="flex items-center justify-between border-b border-white/10 px-3 py-1.5">
-          <span className="text-[11px] font-medium uppercase tracking-wide text-zinc-500">
-            Live transcript
-          </span>
-          {dgStatus && (
-            <span
-              className={`text-[10px] ${
-                dgStatus.startsWith('error') ? 'text-red-300' : 'text-emerald-300'
-              }`}
-            >
-              {dgStatus}
-            </span>
-          )}
-        </div>
-        <div
-          ref={transcriptRef}
-          className="h-full space-y-1.5 overflow-y-auto px-3 py-2 text-sm text-zinc-200"
-        >
-          {finals.length === 0 && !interim.interviewer && !interim.you ? (
-            <span className="text-zinc-500">
-              {capturing
-                ? 'Listening… speech will appear here.'
-                : 'Press “Start listening” to begin live transcription.'}
-            </span>
-          ) : (
-            <>
-              {finals.map((line, i) => (
-                <TranscriptLine
-                  key={i}
-                  source={line.source}
-                  text={line.text}
-                  speaker={line.speaker}
-                  interim={!!line.provisional}
-                  meeting={isMeeting}
-                  name={line.speaker != null ? speakerNames[line.speaker] : undefined}
-                />
-              ))}
-              {interim.interviewer && (
-                <TranscriptLine
-                  source="interviewer"
-                  text={interim.interviewer}
-                  interim
-                  meeting={isMeeting}
-                />
-              )}
-              {interim.you && (
-                <TranscriptLine source="you" text={interim.you} interim meeting={isMeeting} />
-              )}
-            </>
-          )}
-        </div>
-      </div>
+      <TranscriptPanel
+        lines={finals}
+        interim={interim}
+        meeting={isMeeting}
+        speakerNames={speakerNames}
+        statusBySource={statusBySource}
+        captureState={captureState}
+        onSpeakerNameChange={(speaker, name) => {
+          const next = { ...speakerNamesRef.current, [speaker]: name }
+          speakerNamesRef.current = next
+          setSpeakerNames(next)
+        }}
+      />
 
       {/* Manual question */}
       <div className="no-drag mx-3 mb-2 flex items-center gap-2">
@@ -1507,6 +1716,14 @@ export default function OverlayView({
           className="flex-1 rounded-md border border-white/10 bg-black/30 px-2.5 py-1.5 text-xs text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/40 focus:outline-none"
         />
         <button
+          onClick={analyzeScreen}
+          disabled={!screenReady || streaming}
+          title="Analyze the current screen together with the recent transcript"
+          className="rounded-md bg-cyan-500/20 px-2.5 py-1.5 text-xs font-semibold text-cyan-100 hover:bg-cyan-500/30 disabled:opacity-40"
+        >
+          See screen
+        </button>
+        <button
           onClick={askManual}
           disabled={streaming}
           className="rounded-md bg-indigo-500 px-3 py-1.5 text-xs font-semibold text-white hover:bg-indigo-400 disabled:opacity-40"
@@ -1515,214 +1732,35 @@ export default function OverlayView({
         </button>
       </div>
 
-      {/* Suggestion pane */}
-      {isMeeting ? (
-        <div className="no-drag mx-3 mb-3 flex h-[42%] flex-col overflow-hidden rounded-xl border border-indigo-400/20 bg-indigo-500/10">
-          <div className="flex items-center justify-between border-b border-white/10 px-3 py-1.5">
-            <div className="flex items-center gap-1">
-              <button
-                onClick={() => setActiveTab('analysis')}
-                className={`rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${
-                  activeTab === 'analysis'
-                    ? 'bg-indigo-400/25 text-indigo-100'
-                    : 'text-zinc-500 hover:text-zinc-300'
-                }`}
-              >
-                Analysis
-              </button>
-              <button
-                onClick={() => setActiveTab('answer')}
-                className={`rounded px-2 py-0.5 text-[11px] font-medium uppercase tracking-wide ${
-                  activeTab === 'answer'
-                    ? 'bg-indigo-400/25 text-indigo-100'
-                    : 'text-zinc-500 hover:text-zinc-300'
-                }`}
-              >
-                Answer
-              </button>
-            </div>
-            <div className="flex items-center gap-1.5">
-              <button
-                onClick={() => setAutoAnalyze((v) => !v)}
-                title="Continuously analyse the team discussion"
-                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                  autoAnalyze ? 'bg-emerald-400/20 text-emerald-200' : 'bg-white/5 text-zinc-500'
-                }`}
-              >
-                Auto-analyse {autoAnalyze ? 'on' : 'off'}
-              </button>
-              <button
-                onClick={() => setAutoAnswer((v) => !v)}
-                title="Auto-answer when a question is aimed at you"
-                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                  autoAnswer ? 'bg-indigo-400/25 text-indigo-200' : 'bg-white/5 text-zinc-500'
-                }`}
-              >
-                Auto-answer {autoAnswer ? 'on' : 'off'}
-              </button>
-              {streaming ? (
-                <button
-                  onClick={cancelAi}
-                  className="rounded bg-red-500/80 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-500"
-                >
-                  Stop
-                </button>
-              ) : activeTab === 'analysis' ? (
-                <button
-                  onClick={() => {
-                    setActiveTab('analysis')
-                    analyzeDiscussion()
-                  }}
-                  className="rounded bg-emerald-500/90 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-emerald-400"
-                >
-                  Analyse
-                </button>
-              ) : (
-                <button
-                  onClick={() => askAi(true)}
-                  className="rounded bg-indigo-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-indigo-400"
-                >
-                  Answer
-                </button>
-              )}
-              <button
-                onClick={activeTab === 'analysis' ? clearAnalyses : clearAnswers}
-                title={`Clear the ${activeTab === 'analysis' ? 'analysis' : 'answer'} history`}
-                disabled={
-                  activeTab === 'analysis'
-                    ? analysisHistory.length === 0 && !analysis
-                    : answerHistory.length === 0 && !suggestion
-                }
-                className="rounded bg-white/5 px-2 py-0.5 text-[10px] font-semibold text-zinc-300 hover:bg-white/10 disabled:opacity-30"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto px-3 py-2 text-sm leading-relaxed text-zinc-100">
-            {aiError ? (
-              <span className="text-red-300">{aiError}</span>
-            ) : activeTab === 'analysis' ? (
-              analysisHistory.length > 0 || analysis ? (
-                <div>
-                  {analysisHistory.map((a, i) => (
-                    <div key={i} className="mb-3 border-b border-white/10 pb-3 opacity-80">
-                      <Markdown>{a}</Markdown>
-                    </div>
-                  ))}
-                  {analysis && (
-                    <div>
-                      <Markdown>{analysis}</Markdown>
-                      {streaming && intentRef.current === 'analyze' && (
-                        <span className="ml-0.5 animate-pulse text-emerald-300">▍</span>
-                      )}
-                    </div>
-                  )}
-                </div>
-              ) : streaming && intentRef.current === 'analyze' ? (
-                <span className="text-zinc-500">Analysing the discussion…</span>
-              ) : (
-                <span className="text-zinc-500">
-                  Live analysis of the discussion appears here — what’s correct, what to fix, and
-                  smart follow-up questions.
-                </span>
-              )
-            ) : answerHistory.length > 0 || suggestion ? (
-              <div>
-                {answerHistory.map((a, i) => (
-                  <div key={i} className="mb-3 border-b border-white/10 pb-3 opacity-80">
-                    <Markdown>{a}</Markdown>
-                  </div>
-                ))}
-                {suggestion && (
-                  <div>
-                    <Markdown>{suggestion}</Markdown>
-                    {streaming && intentRef.current === 'answer' && (
-                      <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>
-                    )}
-                  </div>
-                )}
-              </div>
-            ) : streaming && intentRef.current === 'answer' ? (
-              <span className="text-zinc-500">Generating…</span>
-            ) : (
-              <span className="text-zinc-500">
-                Answers to questions aimed at you appear here. Press{' '}
-                <kbd className="rounded bg-white/10 px-1">Ctrl+Shift+Enter</kbd> / Answer.
-              </span>
-            )}
-          </div>
-        </div>
-      ) : (
-        <div className="no-drag mx-3 mb-3 flex h-[42%] flex-col overflow-hidden rounded-xl border border-indigo-400/20 bg-indigo-500/10">
-          <div className="flex items-center justify-between border-b border-white/10 px-3 py-1.5">
-            <span className="text-[11px] font-medium uppercase tracking-wide text-indigo-300">
-              AI answer
-            </span>
-            <div className="flex items-center gap-1.5">
-              <button
-                onClick={() => setAutoAnswer((v) => !v)}
-                title="Auto-answer when the interviewer asks a question"
-                className={`rounded px-1.5 py-0.5 text-[10px] font-medium ${
-                  autoAnswer ? 'bg-indigo-400/25 text-indigo-200' : 'bg-white/5 text-zinc-500'
-                }`}
-              >
-                Auto {autoAnswer ? 'on' : 'off'}
-              </button>
-              {streaming ? (
-                <button
-                  onClick={cancelAi}
-                  className="rounded bg-red-500/80 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-red-500"
-                >
-                  Stop
-                </button>
-              ) : (
-                <button
-                  onClick={() => askAi(true)}
-                  className="rounded bg-indigo-500 px-2 py-0.5 text-[10px] font-semibold text-white hover:bg-indigo-400"
-                >
-                  Answer
-                </button>
-              )}
-              <button
-                onClick={clearAnswers}
-                title="Clear the answer history"
-                disabled={answerHistory.length === 0 && !suggestion}
-                className="rounded bg-white/5 px-2 py-0.5 text-[10px] font-semibold text-zinc-300 hover:bg-white/10 disabled:opacity-30"
-              >
-                Clear
-              </button>
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto px-3 py-2 text-sm leading-relaxed text-zinc-100">
-            {aiError ? (
-              <span className="text-red-300">{aiError}</span>
-            ) : answerHistory.length > 0 || suggestion ? (
-              <div>
-                {answerHistory.map((a, i) => (
-                  <div key={i} className="mb-3 border-b border-white/10 pb-3 opacity-80">
-                    <Markdown>{a}</Markdown>
-                  </div>
-                ))}
-                {suggestion && (
-                  <div>
-                    <Markdown>{suggestion}</Markdown>
-                    {streaming && <span className="ml-0.5 animate-pulse text-indigo-300">▍</span>}
-                  </div>
-                )}
-              </div>
-            ) : streaming ? (
-              <span className="text-zinc-500">Generating…</span>
-            ) : (
-              <span className="text-zinc-500">
-                Auto-answers when a question is detected, or press{' '}
-                <kbd className="rounded bg-white/10 px-1">Ctrl+Shift+Enter</kbd> / Answer.
-              </span>
-            )}
-          </div>
-        </div>
-      )}
-
+      <AiWorkspace
+        meeting={isMeeting}
+        activeTab={activeTab}
+        activeIntent={activeIntent}
+        streaming={streaming}
+        screenReady={screenReady}
+        autoAnalyze={autoAnalyze}
+        autoAnswer={autoAnswer}
+        error={aiError}
+        answerHistory={answerHistory}
+        answer={suggestion}
+        analysisHistory={analysisHistory}
+        analysis={analysis}
+        consultantHistory={consultantHistory}
+        consultant={consultant}
+        onTabChange={setActiveTab}
+        onToggleAutoAnalyze={() => setAutoAnalyze((value) => !value)}
+        onToggleAutoAnswer={() => setAutoAnswer((value) => !value)}
+        onCancel={cancelAi}
+        onConsultScreen={consultScreen}
+        onAnalyze={() => {
+          setActiveTab('analysis')
+          analyzeDiscussion(true)
+        }}
+        onAnswer={() => askAi(true)}
+        onClearAnswers={clearAnswers}
+        onClearAnalyses={clearAnalyses}
+        onClearConsultant={clearConsultant}
+      />
       {/* Hotkey legend */}
       <div className="drag border-t border-white/10 px-4 py-2 text-[10px] text-zinc-500">
         <span className="mr-3">Ctrl+Shift+Space show/hide</span>
@@ -1731,63 +1769,20 @@ export default function OverlayView({
         <span>Ctrl+Shift+H hide</span>
       </div>
 
-      {/* Minutes of Meeting modal */}
-      {minutesOpen && (
-        <div className="no-drag fixed inset-0 z-50 flex flex-col bg-zinc-950/95 backdrop-blur">
-          <div className="drag flex items-center justify-between border-b border-white/10 px-4 py-2.5">
-            <span className="text-sm font-semibold text-amber-200">Minutes of Meeting</span>
-            <div className="no-drag flex items-center gap-1.5">
-              {streaming && intentRef.current === 'minutes' ? (
-                <button
-                  onClick={cancelAi}
-                  className="rounded bg-red-500/80 px-2 py-1 text-[11px] font-semibold text-white hover:bg-red-500"
-                >
-                  Stop
-                </button>
-              ) : (
-                <>
-                  <button
-                    onClick={copyMinutes}
-                    disabled={!minutes}
-                    className="rounded bg-white/10 px-2 py-1 text-[11px] font-medium text-zinc-100 hover:bg-white/20 disabled:opacity-40"
-                  >
-                    {minutesCopied ? 'Copied' : 'Copy'}
-                  </button>
-                  <button
-                    onClick={generateMinutes}
-                    disabled={finals.length === 0}
-                    className="rounded bg-amber-500/90 px-2 py-1 text-[11px] font-semibold text-white hover:bg-amber-400 disabled:opacity-40"
-                  >
-                    Regenerate
-                  </button>
-                </>
-              )}
-              <button
-                onClick={() => setMinutesOpen(false)}
-                className="rounded px-2 py-1 text-[11px] text-zinc-400 hover:bg-white/10 hover:text-zinc-100"
-              >
-                Close
-              </button>
-            </div>
-          </div>
-          <div className="flex-1 overflow-y-auto px-5 py-4 text-sm leading-relaxed text-zinc-100">
-            {minutesError ? (
-              <span className="text-red-300">{minutesError}</span>
-            ) : minutes ? (
-              <div>
-                <Markdown>{minutes}</Markdown>
-                {streaming && intentRef.current === 'minutes' && (
-                  <span className="ml-0.5 animate-pulse text-amber-300">▍</span>
-                )}
-              </div>
-            ) : streaming && intentRef.current === 'minutes' ? (
-              <span className="text-zinc-500">Generating minutes from the meeting…</span>
-            ) : (
-              <span className="text-zinc-500">No minutes yet.</span>
-            )}
-          </div>
-        </div>
-      )}
+      <MinutesModal
+        open={minutesOpen}
+        minutes={minutes}
+        error={minutesError}
+        notice={minutesNotice}
+        preparing={minutesPreparing}
+        generating={streaming && activeIntent === 'minutes'}
+        copied={minutesCopied}
+        canRegenerate={finals.length > 0}
+        onCancel={cancelAi}
+        onCopy={() => void copyMinutes()}
+        onRegenerate={() => void generateMinutes()}
+        onClose={() => setMinutesOpen(false)}
+      />
     </div>
   )
 }

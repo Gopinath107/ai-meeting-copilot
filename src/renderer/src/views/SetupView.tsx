@@ -42,6 +42,10 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
   const [docNames, setDocNames] = useState<string[]>([])
   const [docsText, setDocsText] = useState('')
   const [busy, setBusy] = useState<'resume' | 'extra' | null>(null)
+  const [documentNotice, setDocumentNotice] = useState<{
+    kind: 'warning' | 'error'
+    message: string
+  } | null>(null)
   const [showSettings, setShowSettings] = useState(false)
   // Meeting-mode context
   const [userName, setUserName] = useState('')
@@ -50,9 +54,11 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
 
   async function pick(kind: 'resume' | 'extra'): Promise<void> {
     setBusy(kind)
+    setDocumentNotice(null)
     try {
       const res = await window.api.pickDocument(kind)
-      if (res && res.names.length) {
+      if (!res) return
+      if (res.names.length) {
         if (kind === 'resume') {
           setResumeName(res.names[0])
           setResumeText(res.text)
@@ -61,6 +67,14 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
           setDocsText(res.text)
         }
       }
+      if (res.warnings.length) {
+        setDocumentNotice({ kind: 'warning', message: res.warnings.join(' ') })
+      }
+    } catch (error) {
+      setDocumentNotice({
+        kind: 'error',
+        message: error instanceof Error ? error.message : 'The selected document could not be read.'
+      })
     } finally {
       setBusy(null)
     }
@@ -73,7 +87,11 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
         <div className="flex items-center gap-2">
           <div className="h-2.5 w-2.5 rounded-full bg-indigo-400" />
           <span className="text-sm font-semibold text-zinc-100">
-            {mode === 'meeting' ? 'Meeting Copilot' : 'Interview Copilot'}
+            {mode === 'consultant'
+              ? 'Optum Technical Consultant'
+              : mode === 'meeting'
+                ? 'Meeting Copilot'
+                : 'Interview Copilot'}
           </span>
         </div>
         <div className="no-drag flex items-center gap-2">
@@ -101,8 +119,8 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
       {/* Body */}
       <div className="no-drag flex-1 space-y-4 overflow-y-auto px-4 pb-4">
         {/* Mode selector */}
-        <div className="grid grid-cols-2 gap-2 rounded-lg border border-white/10 bg-white/5 p-1">
-          {(['interview', 'meeting'] as const).map((m) => (
+        <div className="grid grid-cols-3 gap-2 rounded-lg border border-white/10 bg-white/5 p-1">
+          {(['interview', 'meeting', 'consultant'] as const).map((m) => (
             <button
               key={m}
               onClick={() => setMode(m)}
@@ -112,31 +130,37 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
                   : 'text-zinc-400 hover:bg-white/5 hover:text-zinc-200'
               }`}
             >
-              {m === 'interview' ? 'Interview' : 'Meeting'}
+              {m === 'interview' ? 'Interview' : m === 'meeting' ? 'Meeting' : 'Consultant'}
             </button>
           ))}
         </div>
         <p className="text-[11px] text-zinc-500">
-          {mode === 'meeting'
+          {mode === 'consultant'
+            ? 'Optum-focused Java, Spring Boot, GraphQL and Insomnia guidance from requirements through implementation and API testing.'
+            : mode === 'meeting'
             ? 'Analyzes the team discussion live — flags issues, suggests fixes and follow-ups, and answers questions aimed at you.'
             : 'Streams first-person answer suggestions when the interviewer asks a question.'}
         </p>
 
         <div>
           <label className="mb-1 block text-xs font-medium text-zinc-400">
-            {mode === 'meeting' ? 'Your role' : 'Role / position'}
+            {mode !== 'interview' ? 'Your role' : 'Role / position'}
           </label>
           <input
             value={role}
             onChange={(e) => setRole(e.target.value)}
             placeholder={
-              mode === 'meeting' ? 'e.g. Backend Lead' : 'e.g. Senior Backend Engineer'
+              mode === 'consultant'
+                ? 'e.g. Java / GraphQL Engineer'
+                : mode === 'meeting'
+                  ? 'e.g. Backend Lead'
+                  : 'e.g. Senior Backend Engineer'
             }
             className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
           />
         </div>
 
-        {mode === 'meeting' && (
+        {mode !== 'interview' && (
           <>
             <div>
               <label className="mb-1 block text-xs font-medium text-zinc-400">Your name</label>
@@ -164,7 +188,7 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
               <input
                 value={techStack}
                 onChange={(e) => setTechStack(e.target.value)}
-                placeholder="e.g. React, Node.js, PostgreSQL, AWS"
+                placeholder={mode === 'consultant' ? 'Java 21, Spring Boot, GraphQL, Insomnia' : 'e.g. React, Node.js, PostgreSQL, AWS'}
                 className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
               />
             </div>
@@ -180,7 +204,8 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
             className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
           />
           <p className="mt-1 text-[11px] text-zinc-500">
-            You join the call normally; the app listens to your system audio locally (stays hidden).
+            You join normally. The app captures system audio; optional Screen mode adds one current
+            frame to AI requests instead of continuously uploading video.
           </p>
         </div>
 
@@ -202,31 +227,41 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
           {mode === 'interview' && (
             <FileRow
               label="Résumé"
-              hint="PDF, DOCX or TXT"
+              hint="PDF, DOCX, TXT or Markdown · up to 8 MB"
               value={
                 resumeName
                   ? `${resumeName}${resumeText ? ` · ${resumeText.length.toLocaleString()} chars parsed` : ' · could not read text'}`
                   : undefined
               }
-              busy={busy === 'resume'}
+              busy={busy !== null}
               onChoose={() => pick('resume')}
             />
           )}
           <FileRow
-            label={mode === 'meeting' ? 'Reference docs' : 'Extra docs'}
+            label={mode !== 'interview' ? 'Reference docs' : 'Extra docs'}
             hint={
-              mode === 'meeting'
-                ? 'Specs, tickets, design docs (optional)'
-                : 'Notes, portfolio, projects (optional)'
+              mode !== 'interview'
+                ? 'Specs, tickets, design docs · up to 8 files'
+                : 'Notes, portfolio, projects · up to 8 files'
             }
             value={
               docNames.length
                 ? `${docNames.length} file(s)${docsText ? ` · ${docsText.length.toLocaleString()} chars` : ''}`
                 : undefined
             }
-            busy={busy === 'extra'}
+            busy={busy !== null}
             onChoose={() => pick('extra')}
           />
+          {documentNotice && (
+            <p
+              role={documentNotice.kind === 'error' ? 'alert' : 'status'}
+              className={`text-[11px] ${
+                documentNotice.kind === 'error' ? 'text-red-300' : 'text-amber-300'
+              }`}
+            >
+              {documentNotice.message}
+            </p>
+          )}
         </div>
       </div>
 
@@ -248,9 +283,10 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
               techStack
             })
           }
-          className="w-full rounded-lg bg-indigo-500 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-400"
+          disabled={busy !== null}
+          className="w-full rounded-lg bg-indigo-500 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
         >
-          {mode === 'meeting' ? 'Start meeting' : 'Start session'}
+          {mode === 'consultant' ? 'Start consultant' : mode === 'meeting' ? 'Start meeting' : 'Start session'}
         </button>
       </div>
 

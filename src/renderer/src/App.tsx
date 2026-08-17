@@ -2,7 +2,7 @@ import { useEffect, useState } from 'react'
 import SetupView from './views/SetupView'
 import OverlayView from './views/OverlayView'
 
-export type SessionMode = 'interview' | 'meeting'
+export type SessionMode = 'interview' | 'meeting' | 'consultant'
 
 export type SessionConfig = {
   mode: SessionMode
