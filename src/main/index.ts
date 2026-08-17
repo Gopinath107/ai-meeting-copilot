@@ -14,12 +14,21 @@ import {
   clipboard
 } from 'electron'
 import { join, extname, basename } from 'path'
-import { readFile } from 'fs/promises'
+import { readFile, stat } from 'fs/promises'
 import * as dotenv from 'dotenv'
 import { DeepgramStream } from './deepgram'
 import { SarvamStream, type AsrStream } from './sarvam'
+import {
+  AsrSessionManager,
+  waitForFinalTranscriptSettle,
+  type AsrKind,
+  type AsrSessionSnapshot
+} from './asrSession'
 import { streamChat, getAzureConfig, type ChatMessage } from './azure'
 import { getSettings, getSettingsStatus, saveSettings, type AppSettings } from './settings'
+import { extractDocxTextInWorker } from './docxParser'
+import type { AiAskRequest, AiTextMessage, ScreenshotContext } from '../shared/ai'
+import type { AudioStopResult, DisplaySourceInfo, PickedDocs } from '../shared/capture'
 
 dotenv.config()
 
@@ -30,6 +39,7 @@ let stealthOn = true
 // Guards reassertStealth() against re-entrancy (showInactive re-fires 'show').
 let reassertingStealth = false
 let aiAbort: AbortController | null = null
+let activeAiRequestId: string | null = null
 const audioSamples = { system: 0, mic: 0 }
 let audioStatsTimer: ReturnType<typeof setInterval> | null = null
 // Capture/transcription sample rate. Must be 16 kHz: Sarvam's streaming STT (the
@@ -43,9 +53,27 @@ let asrProvider: AsrProvider = 'auto'
 // Domain terms (tech stack / product names) to bias Deepgram recognition toward
 // so meeting jargon isn't misheard. Set per session from the renderer.
 let asrKeyterms: string[] = []
-const asrStreams: { system: AsrStream | null; mic: AsrStream | null } = {
-  system: null,
-  mic: null
+const asrSessions = new AsrSessionManager<AsrStream>()
+const finalTranscriptCounts = new Map<string, number>()
+const finalTranscriptListeners = new Set<(kind: AsrKind, generation: number) => void>()
+let selectedDisplaySource: { id: string; displayId: string } | null = null
+
+const DOCUMENT_EXTENSIONS = new Set(['.pdf', '.docx', '.txt', '.md'])
+const MAX_EXTRA_DOCUMENTS = 8
+const MAX_DOCUMENT_BYTES = 8 * 1024 * 1024
+const MAX_TOTAL_DOCUMENT_BYTES = 24 * 1024 * 1024
+const MAX_PDF_PAGES = 100
+const MAX_EXTRACTED_DOCUMENT_CHARS = 200_000
+const DOCUMENT_PARSE_TIMEOUT_MS = 15_000
+
+export function isSafeExternalUrl(value: string): boolean {
+  if (typeof value !== 'string' || value.length > 4096) return false
+  try {
+    const protocol = new URL(value).protocol.toLowerCase()
+    return protocol === 'https:' || protocol === 'http:' || protocol === 'mailto:'
+  } catch {
+    return false
+  }
 }
 
 function createOverlayWindow(): void {
@@ -101,7 +129,13 @@ function createOverlayWindow(): void {
   overlayWindow.on('show', () => reassertStealth())
 
   overlayWindow.webContents.setWindowOpenHandler((details) => {
-    shell.openExternal(details.url)
+    if (isSafeExternalUrl(details.url)) {
+      void shell.openExternal(details.url).catch((error) => {
+        console.warn('Failed to open external URL:', (error as Error).message)
+      })
+    } else {
+      console.warn('Blocked unsafe external URL scheme')
+    }
     return { action: 'deny' }
   })
 
@@ -200,34 +234,74 @@ function sendTranscriptStatus(
   overlayWindow?.webContents.send('transcript:status', { source, status, message })
 }
 
-function startDeepgram(
-  kind: 'system' | 'mic',
+function sendTranscript(
+  kind: AsrKind,
   source: 'interviewer' | 'you',
-  apiKey: string
+  generation: number,
+  stream: AsrStream,
+  text: string,
+  isFinal: boolean,
+  speaker?: number,
+  confidence?: number
 ): void {
-  asrStreams[kind]?.close()
+  if (!asrSessions.isCurrent(kind, generation, stream)) return
+  if (isFinal) {
+    const key = `${kind}:${generation}`
+    finalTranscriptCounts.set(key, (finalTranscriptCounts.get(key) ?? 0) + 1)
+    for (const listener of finalTranscriptListeners) listener(kind, generation)
+  }
+  overlayWindow?.webContents.send('transcript:update', {
+    source,
+    text,
+    isFinal,
+    speaker,
+    confidence
+  })
+}
+
+function startDeepgram(
+  kind: AsrKind,
+  source: 'interviewer' | 'you',
+  apiKey: string,
+  generation: number
+): void {
   const stream = new DeepgramStream({
     apiKey,
     sampleRate: SAMPLE_RATE,
     keyterms: asrKeyterms,
     allowInsecureTls: getSettings().allowInsecureTls,
-    onOpen: () => sendTranscriptStatus(source, 'connected', 'Deepgram'),
-    onTranscript: (text, isFinal, speaker, confidence) =>
-      overlayWindow?.webContents.send('transcript:update', {
-        source,
-        text,
-        isFinal,
-        speaker,
-        confidence
-      }),
-    onError: (error) => {
-      console.error(`Deepgram ${kind} error:`, error.message)
-      sendTranscriptStatus(source, 'error', error.message)
+    onOpen: () => {
+      if (!asrSessions.isCurrent(kind, generation, stream)) return
+      if (asrSessions.isIntentionalClose(kind, generation, stream)) {
+        stream.flush()
+      } else {
+        sendTranscriptStatus(source, 'connected', 'Deepgram')
+      }
     },
-    onClose: () => sendTranscriptStatus(source, 'closed')
+    onTranscript: (text, isFinal, speaker, confidence) =>
+      sendTranscript(kind, source, generation, stream, text, isFinal, speaker, confidence),
+    onError: (error) => {
+      if (!asrSessions.isCurrent(kind, generation, stream)) return
+      console.error(`Deepgram ${kind} error:`, error.message)
+      if (!asrSessions.isIntentionalClose(kind, generation, stream)) {
+        sendTranscriptStatus(source, 'error', error.message)
+      }
+    },
+    onClose: () => {
+      if (!asrSessions.isCurrent(kind, generation, stream)) return
+      const intentional = asrSessions.isIntentionalClose(kind, generation, stream)
+      asrSessions.clearIfCurrent(kind, generation, stream)
+      if (!intentional) sendTranscriptStatus(source, 'closed')
+    }
   })
-  stream.connect()
-  asrStreams[kind] = stream
+  if (!asrSessions.install(kind, generation, stream)) return
+  try {
+    stream.connect()
+  } catch (error) {
+    asrSessions.clearIfCurrent(kind, generation, stream)
+    stream.close()
+    sendTranscriptStatus(source, 'error', (error as Error).message)
+  }
 }
 
 /**
@@ -236,25 +310,26 @@ function startDeepgram(
  * for that source so transcription keeps working.
  */
 function startSarvam(
-  kind: 'system' | 'mic',
+  kind: AsrKind,
   source: 'interviewer' | 'you',
   sarvamApiKey: string,
   deepgramApiKey: string,
+  generation: number,
   codeMixed = false
 ): void {
-  asrStreams[kind]?.close()
   let opened = false
   let switched = false
   const fallback = (reason: string): void => {
-    if (switched || opened) return // only fall back on initial-connection failure
+    if (switched || opened || !asrSessions.canFallback(kind, generation, stream)) return
     switched = true
     if (!deepgramApiKey) {
+      asrSessions.clearIfCurrent(kind, generation, stream)
       sendTranscriptStatus(source, 'error', `Sarvam unavailable (${reason}); no Deepgram fallback`)
       return
     }
     console.warn(`Sarvam ${kind} failed (${reason}) — falling back to Deepgram`)
     sendTranscriptStatus(source, 'connecting', 'Sarvam unavailable — using Deepgram')
-    startDeepgram(kind, source, deepgramApiKey)
+    startDeepgram(kind, source, deepgramApiKey, generation)
   }
   const stream = new SarvamStream({
     apiKey: sarvamApiKey,
@@ -263,40 +338,52 @@ function startSarvam(
     // Sarvam auto-detect and transcribe the mixed speech instead of forcing
     // English-only. Interview mode stays 'en-IN' (English, Indian accent).
     language: codeMixed ? 'unknown' : 'en-IN',
-    allowInsecureTls: getSettings().allowInsecureTls,
     onOpen: () => {
+      if (!asrSessions.isCurrent(kind, generation, stream)) return
       opened = true
-      sendTranscriptStatus(source, 'connected', 'Sarvam')
+      if (asrSessions.isIntentionalClose(kind, generation, stream)) {
+        stream.flush()
+      } else {
+        sendTranscriptStatus(source, 'connected', 'Sarvam')
+      }
     },
     onTranscript: (text, isFinal, speaker, confidence) =>
-      overlayWindow?.webContents.send('transcript:update', {
-        source,
-        text,
-        isFinal,
-        speaker,
-        confidence
-      }),
+      sendTranscript(kind, source, generation, stream, text, isFinal, speaker, confidence),
     onError: (error) => {
+      if (!asrSessions.isCurrent(kind, generation, stream)) return
       console.error(`Sarvam ${kind} error:`, error.message)
+      if (asrSessions.isIntentionalClose(kind, generation, stream)) return
       if (opened) sendTranscriptStatus(source, 'error', error.message)
       else fallback(error.message)
     },
     onClose: () => {
-      if (opened) sendTranscriptStatus(source, 'closed')
-      else fallback('connection closed')
+      if (!asrSessions.isCurrent(kind, generation, stream)) return
+      if (asrSessions.isIntentionalClose(kind, generation, stream)) {
+        asrSessions.clearIfCurrent(kind, generation, stream)
+      } else if (opened) {
+        asrSessions.clearIfCurrent(kind, generation, stream)
+        sendTranscriptStatus(source, 'closed')
+      } else {
+        fallback('connection closed')
+      }
     }
   })
-  stream.connect()
-  asrStreams[kind] = stream
+  if (!asrSessions.install(kind, generation, stream)) return
+  try {
+    stream.connect()
+  } catch (error) {
+    fallback((error as Error).message)
+  }
 }
 
-function startAsr(kind: 'system' | 'mic', source: 'interviewer' | 'you'): void {
+function startAsr(kind: AsrKind, source: 'interviewer' | 'you'): void {
+  const generation = asrSessions.begin(kind)
   const s = getSettings()
   // Force Deepgram when the user wants per-speaker labels (diarization). Good
   // for English meetings where telling participants apart matters.
   if (asrProvider === 'deepgram') {
     if (s.deepgramApiKey) {
-      startDeepgram(kind, source, s.deepgramApiKey)
+      startDeepgram(kind, source, s.deepgramApiKey, generation)
     } else {
       sendTranscriptStatus(source, 'error', 'Deepgram key not set (needed for speaker labels)')
     }
@@ -308,9 +395,9 @@ function startAsr(kind: 'system' | 'mic', source: 'interviewer' | 'you'): void {
   // and garble English words.
   if (asrProvider === 'sarvam') {
     if (s.sarvamApiKey) {
-      startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, false)
+      startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, generation, false)
     } else if (s.deepgramApiKey) {
-      startDeepgram(kind, source, s.deepgramApiKey)
+      startDeepgram(kind, source, s.deepgramApiKey, generation)
     } else {
       sendTranscriptStatus(source, 'error', 'Speech service not configured')
     }
@@ -318,53 +405,306 @@ function startAsr(kind: 'system' | 'mic', source: 'interviewer' | 'you'): void {
   }
   // 'auto': Sarvam primary (English en-IN for accuracy), Deepgram fallback.
   if (s.sarvamApiKey) {
-    startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, false)
+    startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, generation, false)
   } else if (s.deepgramApiKey) {
-    startDeepgram(kind, source, s.deepgramApiKey)
+    startDeepgram(kind, source, s.deepgramApiKey, generation)
   } else {
     sendTranscriptStatus(source, 'error', 'Speech service not configured')
   }
 }
 
 function stopAsr(): void {
-  asrStreams.system?.close()
-  asrStreams.mic?.close()
-  asrStreams.system = null
-  asrStreams.mic = null
+  asrSessions.stopAll()
+}
+
+async function gracefullyStopAsr(timeoutMs: number): Promise<AudioStopResult> {
+  const snapshots = (['system', 'mic'] as const)
+    .map((kind) => asrSessions.beginIntentionalClose(kind))
+    .filter((snapshot): snapshot is AsrSessionSnapshot<AsrStream> => snapshot !== null)
+  const startedAt = Date.now()
+  if (snapshots.length === 0) {
+    return { timedOut: false, waitedMs: 0, finalizedKinds: [] }
+  }
+
+  const sessionKeys = new Set(
+    snapshots.map((snapshot) => `${snapshot.kind}:${snapshot.generation}`)
+  )
+  const countFor = (snapshot: AsrSessionSnapshot<AsrStream>): number =>
+    finalTranscriptCounts.get(`${snapshot.kind}:${snapshot.generation}`) ?? 0
+  const initialCounts = new Map(
+    snapshots.map((snapshot) => [`${snapshot.kind}:${snapshot.generation}`, countFor(snapshot)])
+  )
+  const waits = snapshots.map((snapshot) =>
+    waitForFinalTranscriptSettle(
+      () => countFor(snapshot),
+      (listener) => {
+        const scopedListener = (kind: AsrKind, generation: number): void => {
+          if (kind === snapshot.kind && generation === snapshot.generation) listener()
+        }
+        finalTranscriptListeners.add(scopedListener)
+        return () => finalTranscriptListeners.delete(scopedListener)
+      },
+      timeoutMs
+    )
+  )
+
+  for (const snapshot of snapshots) snapshot.stream.flush()
+  const settled = await Promise.all(waits)
+  for (const snapshot of snapshots) asrSessions.closeSnapshot(snapshot)
+
+  const result: AudioStopResult = {
+    timedOut: settled.some((entry) => entry.timedOut),
+    waitedMs: Date.now() - startedAt,
+    finalizedKinds: snapshots
+      .filter(
+        (snapshot) =>
+          countFor(snapshot) >
+          (initialCounts.get(`${snapshot.kind}:${snapshot.generation}`) ?? 0)
+      )
+      .map((snapshot) => snapshot.kind)
+  }
+  for (const key of sessionKeys) finalTranscriptCounts.delete(key)
+  return result
 }
 
 /** Extract plain text from a résumé/doc file (pdf, docx, or plain text). */
+export function isSupportedDocumentPath(filePath: string): boolean {
+  return DOCUMENT_EXTENSIONS.has(extname(filePath).toLowerCase())
+}
+
+function withTimeout<T>(operation: Promise<T>, timeoutMs: number, label: string): Promise<T> {
+  let timer: ReturnType<typeof setTimeout> | undefined
+  const timeout = new Promise<never>((_resolve, reject) => {
+    timer = setTimeout(() => reject(new Error(`${label} timed out after ${timeoutMs} ms`)), timeoutMs)
+  })
+  return Promise.race([operation, timeout]).finally(() => {
+    if (timer) clearTimeout(timer)
+  })
+}
+
 async function extractText(filePath: string): Promise<string> {
   const ext = extname(filePath).toLowerCase()
+  if (!DOCUMENT_EXTENSIONS.has(ext)) {
+    throw new Error(`Unsupported document type: ${ext || 'no extension'}`)
+  }
+  const metadata = await stat(filePath)
+  if (!metadata.isFile()) throw new Error('The selected path is not a file')
+  if (metadata.size > MAX_DOCUMENT_BYTES) {
+    throw new Error(`File is larger than the ${MAX_DOCUMENT_BYTES / 1024 / 1024} MB limit`)
+  }
   const buf = await readFile(filePath)
+  if (buf.byteLength > MAX_DOCUMENT_BYTES) {
+    throw new Error(`File grew beyond the ${MAX_DOCUMENT_BYTES / 1024 / 1024} MB limit`)
+  }
   try {
     if (ext === '.pdf') {
       const { PDFParse } = await import('pdf-parse')
-      const parser = new PDFParse({ data: new Uint8Array(buf) })
+      const parser = new PDFParse({
+        data: new Uint8Array(buf),
+        stopAtErrors: true,
+        isEvalSupported: false,
+        enableXfa: false,
+        disableFontFace: true,
+        maxImageSize: 10_000_000
+      })
       try {
-        return (await parser.getText()).text
+        return await withTimeout(
+          (async () => {
+            const info = await parser.getInfo()
+            if (info.total > MAX_PDF_PAGES) {
+              throw new Error(`PDF has ${info.total} pages; the limit is ${MAX_PDF_PAGES}`)
+            }
+            const text = (await parser.getText({ first: MAX_PDF_PAGES })).text
+            return text.slice(0, MAX_EXTRACTED_DOCUMENT_CHARS)
+          })(),
+          DOCUMENT_PARSE_TIMEOUT_MS,
+          'PDF parsing'
+        )
       } finally {
-        await parser.destroy()
+        await withTimeout(parser.destroy(), 2_000, 'PDF cleanup').catch(() => undefined)
       }
     }
     if (ext === '.docx') {
-      const mammoth = await import('mammoth')
-      return (await mammoth.extractRawText({ buffer: buf })).value
+      return await extractDocxTextInWorker(buf, {
+        timeoutMs: DOCUMENT_PARSE_TIMEOUT_MS,
+        maxCharacters: MAX_EXTRACTED_DOCUMENT_CHARS
+      })
     }
   } catch (error) {
     console.error('Failed to parse', filePath, (error as Error).message)
-    return ''
+    throw new Error(`Could not parse ${basename(filePath)}: ${(error as Error).message}`, {
+      cause: error
+    })
   }
-  return buf.toString('utf-8')
+  return buf.toString('utf-8').slice(0, MAX_EXTRACTED_DOCUMENT_CHARS)
+}
+
+type ValidatedDocument = { filePath: string; name: string; size: number }
+
+async function validateDocumentSelection(
+  filePaths: string[],
+  kind: 'resume' | 'extra'
+): Promise<{ documents: ValidatedDocument[]; warnings: string[] }> {
+  const warnings: string[] = []
+  const maxCount = kind === 'resume' ? 1 : MAX_EXTRA_DOCUMENTS
+  const candidates = filePaths.slice(0, maxCount)
+  if (filePaths.length > maxCount) {
+    warnings.push(
+      `${filePaths.length - maxCount} file(s) were skipped; you can select at most ${maxCount}.`
+    )
+  }
+
+  const documents: ValidatedDocument[] = []
+  let totalBytes = 0
+  for (const filePath of candidates) {
+    const name = basename(filePath)
+    if (!isSupportedDocumentPath(filePath)) {
+      warnings.push(`${name} was skipped. Supported types: PDF, DOCX, TXT, and Markdown.`)
+      continue
+    }
+    try {
+      const metadata = await stat(filePath)
+      if (!metadata.isFile()) {
+        warnings.push(`${name} was skipped because it is not a regular file.`)
+        continue
+      }
+      if (metadata.size > MAX_DOCUMENT_BYTES) {
+        warnings.push(
+          `${name} was skipped because it exceeds the ${MAX_DOCUMENT_BYTES / 1024 / 1024} MB per-file limit.`
+        )
+        continue
+      }
+      if (totalBytes + metadata.size > MAX_TOTAL_DOCUMENT_BYTES) {
+        warnings.push(
+          `${name} was skipped because the selection exceeds the ${MAX_TOTAL_DOCUMENT_BYTES / 1024 / 1024} MB total limit.`
+        )
+        continue
+      }
+      totalBytes += metadata.size
+      documents.push({ filePath, name, size: metadata.size })
+    } catch (error) {
+      warnings.push(`${name} could not be inspected: ${(error as Error).message}`)
+    }
+  }
+  return { documents, warnings }
+}
+
+function isOverlaySender(event: Electron.IpcMainEvent | Electron.IpcMainInvokeEvent): boolean {
+  return Boolean(
+    overlayWindow &&
+      !overlayWindow.isDestroyed() &&
+      !overlayWindow.webContents.isDestroyed() &&
+      event.sender === overlayWindow.webContents
+  )
+}
+
+function assertOverlaySender(event: Electron.IpcMainInvokeEvent): void {
+  if (!isOverlaySender(event)) throw new Error('Unauthorized IPC sender')
+}
+
+function parseSettingsInput(value: unknown): Partial<AppSettings> {
+  if (!value || typeof value !== 'object' || Array.isArray(value)) {
+    throw new Error('Invalid settings payload')
+  }
+  const input = value as Record<string, unknown>
+  type StringSetting = Exclude<keyof AppSettings, 'allowInsecureTls'>
+  const limits: Record<StringSetting, number> = {
+    sarvamApiKey: 16 * 1024,
+    deepgramApiKey: 16 * 1024,
+    azureApiKey: 16 * 1024,
+    azureEndpoint: 2 * 1024,
+    azureDeployment: 512,
+    azureApiVersion: 128
+  }
+  const strings: Partial<Record<StringSetting, string>> = {}
+  for (const key of Object.keys(limits) as StringSetting[]) {
+    const candidate = input[key]
+    if (candidate === undefined) continue
+    if (typeof candidate !== 'string' || candidate.length > limits[key]) {
+      throw new Error(`Invalid ${key} setting`)
+    }
+    strings[key] = candidate
+  }
+  const insecure = input.allowInsecureTls
+  if (insecure !== undefined && typeof insecure !== 'boolean') {
+    throw new Error('Invalid allowInsecureTls setting')
+  }
+  return {
+    ...strings,
+    ...(typeof insecure === 'boolean' ? { allowInsecureTls: insecure } : {})
+  }
+}
+
+async function getDisplaySources(): Promise<Electron.DesktopCapturerSource[]> {
+  return desktopCapturer.getSources({
+    types: ['screen'],
+    thumbnailSize: { width: 0, height: 0 },
+    fetchWindowIcons: false
+  })
+}
+
+function primaryDisplaySource(
+  sources: Electron.DesktopCapturerSource[]
+): Electron.DesktopCapturerSource | undefined {
+  const primaryDisplayId = String(screen.getPrimaryDisplay().id)
+  return sources.find((source) => source.display_id === primaryDisplayId) ?? sources[0]
+}
+
+function resolveSelectedDisplaySource(
+  sources: Electron.DesktopCapturerSource[]
+): Electron.DesktopCapturerSource | undefined {
+  const preference = selectedDisplaySource
+  const selected = preference
+    ? sources.find(
+        (source) =>
+          source.id === preference.id ||
+          (preference.displayId.length > 0 && source.display_id === preference.displayId)
+      )
+    : undefined
+  const resolved = selected ?? primaryDisplaySource(sources)
+  if (resolved && !selected) {
+    selectedDisplaySource = { id: resolved.id, displayId: resolved.display_id }
+  }
+  return resolved
+}
+
+function serializeDisplaySource(
+  source: Electron.DesktopCapturerSource,
+  selected: Electron.DesktopCapturerSource | undefined
+): DisplaySourceInfo {
+  return {
+    id: source.id,
+    name: source.name,
+    displayId: source.display_id,
+    isPrimary: source.display_id === String(screen.getPrimaryDisplay().id),
+    isSelected: source.id === selected?.id
+  }
+}
+
+async function listDisplaySources(): Promise<DisplaySourceInfo[]> {
+  const sources = await getDisplaySources()
+  const selected = resolveSelectedDisplaySource(sources)
+  return sources.map((source) => serializeDisplaySource(source, selected))
 }
 
 function setupAudio(): void {
   // Grant system-audio loopback for getDisplayMedia (the interviewer's voice).
   session.defaultSession.setDisplayMediaRequestHandler(
-    (_request, callback) => {
-      desktopCapturer
-        .getSources({ types: ['screen'] })
-        .then((sources) => callback({ video: sources[0], audio: 'loopback' }))
+    (request, callback) => {
+      if (!overlayWindow || request.frame !== overlayWindow.webContents.mainFrame) {
+        callback({})
+        return
+      }
+      getDisplaySources()
+        .then((sources) => {
+          const source = resolveSelectedDisplaySource(sources)
+          if (!source) {
+            console.error('No display source is available for system-audio capture')
+            callback({})
+            return
+          }
+          callback({ video: source, audio: request.audioRequested ? 'loopback' : undefined })
+        })
         .catch((error) => {
           console.error('desktopCapturer failed:', error)
           callback({})
@@ -373,22 +713,48 @@ function setupAudio(): void {
     { useSystemPicker: false }
   )
 
-  // Allow microphone access from the renderer.
-  session.defaultSession.setPermissionRequestHandler((_wc, permission, callback) => {
-    callback(permission === 'media')
+  // Allow microphone and display capture only from the trusted overlay renderer.
+  session.defaultSession.setPermissionRequestHandler((webContents, permission, callback) => {
+    callback(
+      (permission === 'media' || permission === 'display-capture') &&
+        webContents === overlayWindow?.webContents
+    )
   })
-  session.defaultSession.setPermissionCheckHandler((_wc, permission) => permission === 'media')
+  session.defaultSession.setPermissionCheckHandler((webContents, permission) => {
+    // Electron's PermissionCheckHandler type lags the runtime permission list in
+    // some releases, but Chromium can still query `display-capture` here.
+    const requestedPermission: string = permission
+    return (
+      (requestedPermission === 'media' || requestedPermission === 'display-capture') &&
+      webContents === overlayWindow?.webContents
+    )
+  })
 
   // Receive 16 kHz PCM chunks from the renderer and forward them to Deepgram.
-  ipcMain.on('audio:chunk', (_event, kind: 'system' | 'mic', buffer: ArrayBuffer) => {
-    if (kind === 'system' || kind === 'mic') {
+  ipcMain.on('audio:chunk', (event, kind: unknown, buffer: unknown) => {
+    if (
+      isOverlaySender(event) &&
+      (kind === 'system' || kind === 'mic') &&
+      buffer instanceof ArrayBuffer &&
+      buffer.byteLength > 0 &&
+      buffer.byteLength <= 64 * 1024 &&
+      buffer.byteLength % 2 === 0
+    ) {
       audioSamples[kind] += buffer.byteLength / 2
-      asrStreams[kind]?.send(buffer)
+      asrSessions.current(kind)?.send(buffer)
     }
   })
-  ipcMain.on('audio:start', (_event, mic: boolean, provider?: AsrProvider, keyterms?: string[]) => {
+  ipcMain.on('audio:start', (event, mic: unknown, provider?: unknown, keyterms?: unknown) => {
+    if (!isOverlaySender(event) || typeof mic !== 'boolean') return
+    stopAsr()
     asrProvider = provider === 'deepgram' || provider === 'sarvam' ? provider : 'auto'
-    asrKeyterms = Array.isArray(keyterms) ? keyterms.filter((t) => typeof t === 'string') : []
+    asrKeyterms = Array.isArray(keyterms)
+      ? keyterms
+          .filter((term): term is string => typeof term === 'string')
+          .map((term) => term.trim().slice(0, 100))
+          .filter(Boolean)
+          .slice(0, 100)
+      : []
     audioSamples.system = 0
     audioSamples.mic = 0
     if (audioStatsTimer) clearInterval(audioStatsTimer)
@@ -413,12 +779,37 @@ function setupAudio(): void {
     startAsr('system', 'interviewer')
     if (mic) startAsr('mic', 'you')
   })
-  ipcMain.on('audio:stop', () => {
+  ipcMain.on('audio:setMic', (event, enabled: unknown) => {
+    if (!isOverlaySender(event) || typeof enabled !== 'boolean') return
+    if (enabled) {
+      if (!asrSessions.current('mic')) {
+        audioSamples.mic = 0
+        startAsr('mic', 'you')
+      }
+    } else {
+      asrSessions.stop('mic')
+      sendTranscriptStatus('you', 'closed', 'Microphone disabled')
+    }
+  })
+  ipcMain.on('audio:stop', (event) => {
+    if (!isOverlaySender(event)) return
     if (audioStatsTimer) {
       clearInterval(audioStatsTimer)
       audioStatsTimer = null
     }
     stopAsr()
+  })
+  ipcMain.handle('audio:stopGracefully', async (event, requestedTimeout?: unknown) => {
+    if (!isOverlaySender(event)) throw new Error('Unauthorized audio stop request')
+    if (audioStatsTimer) {
+      clearInterval(audioStatsTimer)
+      audioStatsTimer = null
+    }
+    const timeoutMs =
+      typeof requestedTimeout === 'number' && Number.isFinite(requestedTimeout)
+        ? Math.max(300, Math.min(5000, Math.round(requestedTimeout)))
+        : 1800
+    return gracefullyStopAsr(timeoutMs)
   })
 }
 
@@ -459,13 +850,93 @@ function setupTray(): void {
   }
 }
 
+function validScreenshot(value: unknown): value is ScreenshotContext {
+  if (!value || typeof value !== 'object') return false
+  const shot = value as Partial<ScreenshotContext>
+  if (typeof shot.dataUrl !== 'string' || shot.dataUrl.length > 6_000_000) return false
+  if (!/^data:image\/jpeg;base64,[A-Za-z0-9+/]+={0,2}$/.test(shot.dataUrl)) return false
+  if (!Number.isFinite(shot.capturedAt) || !Number.isInteger(shot.width) || !Number.isInteger(shot.height)) {
+    return false
+  }
+  if (Math.abs(Date.now() - (shot.capturedAt ?? 0)) > 30_000) return false
+  if ((shot.width ?? 0) <= 0 || (shot.width ?? 0) > 4096) return false
+  if ((shot.height ?? 0) <= 0 || (shot.height ?? 0) > 4096) return false
+  return shot.detail === 'low' || shot.detail === 'auto' || shot.detail === 'high'
+}
+
+function validTextMessages(value: unknown): value is AiTextMessage[] {
+  if (!Array.isArray(value) || value.length === 0 || value.length > 20) return false
+  let total = 0
+  for (const message of value) {
+    if (!message || typeof message !== 'object') return false
+    const m = message as Partial<AiTextMessage>
+    if (m.role !== 'system' && m.role !== 'user' && m.role !== 'assistant') return false
+    if (typeof m.content !== 'string') return false
+    total += m.content.length
+    if (m.content.length > 500_000 || total > 1_000_000) return false
+  }
+  return value[value.length - 1]?.role === 'user'
+}
+
+function parseAiRequest(value: unknown): AiAskRequest | null {
+  if (!value || typeof value !== 'object') return null
+  const request = value as Partial<AiAskRequest>
+  if (
+    typeof request.requestId !== 'string' ||
+    !/^[A-Za-z0-9._:-]{1,100}$/.test(request.requestId)
+  ) {
+    return null
+  }
+  if (
+    request.intent !== 'answer' &&
+    request.intent !== 'analyze' &&
+    request.intent !== 'summarize' &&
+    request.intent !== 'minutes'
+  ) {
+    return null
+  }
+  if (!validTextMessages(request.messages)) return null
+  if (request.screenshot !== undefined) {
+    if (request.intent !== 'answer' && request.intent !== 'analyze') return null
+    if (!validScreenshot(request.screenshot)) return null
+  }
+  return request as AiAskRequest
+}
+
+function azureMessages(request: AiAskRequest): ChatMessage[] {
+  if (!request.screenshot) return request.messages
+  const last = request.messages[request.messages.length - 1]
+  return [
+    ...request.messages.slice(0, -1),
+    {
+      role: 'user',
+      content: [
+        {
+          type: 'text',
+          text:
+            `${last.content}\n\nA current screenshot is attached. Use it with the transcript to understand what is being shown. ` +
+            'Only rely on text and details that are visibly legible.'
+        },
+        {
+          type: 'image_url',
+          image_url: { url: request.screenshot.dataUrl, detail: request.screenshot.detail }
+        }
+      ]
+    }
+  ]
+}
+
 app.whenReady().then(() => {
   createOverlayWindow()
   registerHotkeys()
   setupTray()
 
-  ipcMain.handle('app:getVersion', () => app.getVersion())
-  ipcMain.handle('app:hasKeys', () => {
+  ipcMain.handle('app:getVersion', (event) => {
+    assertOverlaySender(event)
+    return app.getVersion()
+  })
+  ipcMain.handle('app:hasKeys', (event) => {
+    assertOverlaySender(event)
     const s = getSettingsStatus()
     return {
       deepgram: s.sarvamKeySet || s.deepgramKeySet,
@@ -473,79 +944,166 @@ app.whenReady().then(() => {
     }
   })
 
-  ipcMain.handle('settings:get', () => getSettingsStatus())
-  ipcMain.handle('settings:save', (_event, partial: Partial<AppSettings>) => {
-    saveSettings(partial)
+  ipcMain.handle('settings:get', (event) => {
+    assertOverlaySender(event)
+    return getSettingsStatus()
+  })
+  ipcMain.handle('settings:save', (event, partial: unknown) => {
+    assertOverlaySender(event)
+    saveSettings(parseSettingsInput(partial))
     return getSettingsStatus()
   })
 
-  ipcMain.on('window:hide', () => overlayWindow?.hide())
-  ipcMain.on('window:quit', () => app.quit())
-  ipcMain.on('window:setClickThrough', (_event, value: boolean) => {
+  ipcMain.on('window:hide', (event) => {
+    if (isOverlaySender(event)) overlayWindow?.hide()
+  })
+  ipcMain.on('window:quit', (event) => {
+    if (isOverlaySender(event)) app.quit()
+  })
+  ipcMain.on('window:setClickThrough', (event, value: unknown) => {
+    if (!isOverlaySender(event) || typeof value !== 'boolean') return
     clickThrough = value
     overlayWindow?.setIgnoreMouseEvents(value, { forward: true })
   })
 
-  ipcMain.handle('window:getStealth', () => stealthOn)
-  ipcMain.on('window:setStealth', (_event, value: boolean) => {
+  ipcMain.handle('window:getStealth', (event) => {
+    assertOverlaySender(event)
+    return stealthOn
+  })
+  ipcMain.on('window:setStealth', (event, value: unknown) => {
+    if (!isOverlaySender(event) || typeof value !== 'boolean') return
     applyStealth(value)
   })
 
-  ipcMain.handle('ai:hasConfig', () => getAzureConfig() !== null)
-  ipcMain.on('ai:ask', (_event, messages: ChatMessage[]) => {
+  ipcMain.handle('ai:hasConfig', (event) => {
+    assertOverlaySender(event)
+    return getAzureConfig() !== null
+  })
+  ipcMain.on('ai:ask', (event, payload: unknown) => {
+    if (!overlayWindow || event.sender !== overlayWindow.webContents) return
+    const request = parseAiRequest(payload)
+    if (!request) {
+      const candidateId = (payload as { requestId?: unknown } | null)?.requestId
+      const requestId =
+        typeof candidateId === 'string' && /^[A-Za-z0-9._:-]{1,100}$/.test(candidateId)
+          ? candidateId
+          : 'invalid-request'
+      event.sender.send('ai:error', {
+        requestId,
+        message: 'Invalid AI request payload'
+      })
+      return
+    }
     const config = getAzureConfig()
     if (!config) {
-      overlayWindow?.webContents.send('ai:error', 'AI service not configured')
+      overlayWindow.webContents.send('ai:error', {
+        requestId: request.requestId,
+        message: 'AI service not configured'
+      })
       return
     }
     aiAbort?.abort()
-    aiAbort = new AbortController()
+    const controller = new AbortController()
+    aiAbort = controller
+    activeAiRequestId = request.requestId
     void streamChat(
       config,
-      messages,
+      azureMessages(request),
       {
-        onToken: (text) => overlayWindow?.webContents.send('ai:token', text),
-        onDone: () => overlayWindow?.webContents.send('ai:done'),
-        onError: (error) => overlayWindow?.webContents.send('ai:error', error.message)
+        onToken: (text) => {
+          if (activeAiRequestId === request.requestId) {
+            overlayWindow?.webContents.send('ai:token', { requestId: request.requestId, text })
+          }
+        },
+        onDone: () => {
+          if (activeAiRequestId !== request.requestId) return
+          overlayWindow?.webContents.send('ai:done', { requestId: request.requestId })
+          activeAiRequestId = null
+          if (aiAbort === controller) aiAbort = null
+        },
+        onError: (error) => {
+          if (activeAiRequestId !== request.requestId) return
+          overlayWindow?.webContents.send('ai:error', {
+            requestId: request.requestId,
+            message: error.message
+          })
+          activeAiRequestId = null
+          if (aiAbort === controller) aiAbort = null
+        }
       },
-      aiAbort.signal
+      controller.signal
     )
   })
-  ipcMain.on('ai:cancel', () => {
+  ipcMain.on('ai:cancel', (event, requestId?: string) => {
+    if (!overlayWindow || event.sender !== overlayWindow.webContents) return
+    if (requestId && activeAiRequestId !== requestId) return
+    activeAiRequestId = null
     aiAbort?.abort()
     aiAbort = null
   })
 
-  ipcMain.handle('docs:pick', async (_event, kind: 'resume' | 'extra') => {
+  ipcMain.handle('display:listSources', async (event) => {
+    if (!isOverlaySender(event)) throw new Error('Unauthorized display-source request')
+    return listDisplaySources()
+  })
+  ipcMain.handle('display:selectSource', async (event, sourceId: unknown) => {
+    if (!isOverlaySender(event)) throw new Error('Unauthorized display-source request')
+    if (typeof sourceId !== 'string' || sourceId.length === 0 || sourceId.length > 256) {
+      throw new Error('Invalid display source identifier')
+    }
+    const sources = await getDisplaySources()
+    const source = sources.find((candidate) => candidate.id === sourceId)
+    if (!source) {
+      throw new Error('That display is no longer available. Refresh the display list and try again.')
+    }
+    selectedDisplaySource = { id: source.id, displayId: source.display_id }
+    return serializeDisplaySource(source, source)
+  })
+
+  ipcMain.handle('docs:pick', async (event, requestedKind: unknown): Promise<PickedDocs | null> => {
+    if (!isOverlaySender(event)) throw new Error('Unauthorized document request')
+    if (requestedKind !== 'resume' && requestedKind !== 'extra') {
+      throw new Error('Document selection must be either resume or extra documents')
+    }
+    const kind = requestedKind
     const opts: Electron.OpenDialogOptions = {
       title: kind === 'resume' ? 'Select your résumé' : 'Select documents',
       properties: kind === 'extra' ? ['openFile', 'multiSelections'] : ['openFile'],
-      filters: [
-        { name: 'Documents', extensions: ['pdf', 'docx', 'txt', 'md'] },
-        { name: 'All files', extensions: ['*'] }
-      ]
+      filters: [{ name: 'Documents', extensions: ['pdf', 'docx', 'txt', 'md'] }]
     }
     const result = overlayWindow
       ? await dialog.showOpenDialog(overlayWindow, opts)
       : await dialog.showOpenDialog(opts)
     if (result.canceled || result.filePaths.length === 0) return null
+    const validated = await validateDocumentSelection(result.filePaths, kind)
     const names: string[] = []
     const parts: string[] = []
-    for (const filePath of result.filePaths) {
-      names.push(basename(filePath))
-      const text = (await extractText(filePath)).trim()
-      if (text) parts.push(text)
+    for (const document of validated.documents) {
+      try {
+        const text = (await extractText(document.filePath)).trim()
+        names.push(document.name)
+        if (text) parts.push(text)
+        else validated.warnings.push(`${document.name} contained no readable text.`)
+      } catch (error) {
+        validated.warnings.push((error as Error).message)
+      }
     }
     const cap = kind === 'resume' ? 8000 : 5000
-    return { names, text: parts.join('\n\n---\n\n').slice(0, cap) }
+    const combined = parts.join('\n\n---\n\n')
+    if (combined.length > cap) {
+      validated.warnings.push(`Extracted text was shortened to ${cap.toLocaleString()} characters.`)
+    }
+    return { names, text: combined.slice(0, cap), warnings: validated.warnings }
   })
 
   // Reliable copy-to-clipboard from the renderer. The web Clipboard API can fail
   // silently in a transparent, always-on-top, often-unfocused overlay window, so
   // we write through Electron's main-process clipboard instead.
-  ipcMain.handle('clipboard:write', (_event, text: string) => {
+  ipcMain.handle('clipboard:write', (event, text: unknown) => {
+    assertOverlaySender(event)
+    if (typeof text !== 'string' || text.length > 2 * 1024 * 1024) return false
     try {
-      clipboard.writeText(typeof text === 'string' ? text : String(text))
+      clipboard.writeText(text)
       return true
     } catch (error) {
       console.error('clipboard write failed:', error)
@@ -569,6 +1127,7 @@ app.on('will-quit', () => {
   if (audioStatsTimer) clearInterval(audioStatsTimer)
   stopAsr()
   aiAbort?.abort()
+  activeAiRequestId = null
   tray?.destroy()
   tray = null
 })

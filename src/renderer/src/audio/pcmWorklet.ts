@@ -7,6 +7,20 @@ class PCMProcessor extends AudioWorkletProcessor {
     super()
     this._buffer = []
     this._chunkSize = 1600 // ~100ms at 16 kHz
+    this.port.onmessage = (event) => {
+      const message = event.data
+      if (message && message.type === 'flush' && typeof message.requestId === 'string') {
+        this._emitBuffered()
+        this.port.postMessage({ type: 'flushed', requestId: message.requestId })
+      }
+    }
+  }
+
+  _emitBuffered() {
+    if (this._buffer.length === 0) return
+    const pcm = new Int16Array(this._buffer)
+    this._buffer = []
+    this.port.postMessage(pcm, [pcm.buffer])
   }
 
   process(inputs) {
@@ -26,9 +40,7 @@ class PCMProcessor extends AudioWorkletProcessor {
         this._buffer.push(clamped < 0 ? clamped * 0x8000 : clamped * 0x7fff)
       }
       if (this._buffer.length >= this._chunkSize) {
-        const pcm = new Int16Array(this._buffer)
-        this._buffer = []
-        this.port.postMessage(pcm, [pcm.buffer])
+        this._emitBuffered()
       }
     }
     return true

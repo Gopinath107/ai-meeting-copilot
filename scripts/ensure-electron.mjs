@@ -16,8 +16,8 @@
  *   3. Else trigger Electron's real downloader, then extract.
  *   4. Write `path.txt` so `require('electron')` resolves.
  *
- * It is safe to run repeatedly and NEVER hard-fails an install
- * (always exits 0) so it can be wired as an npm "postinstall" hook.
+ * It is safe to run repeatedly. A failed repair returns a non-zero exit code so
+ * setup cannot claim success while leaving an unusable Electron installation.
  *
  * Runs on Windows / macOS / Linux.
  */
@@ -38,12 +38,11 @@ const projectRoot = join(here, '..')
 const electronDir = join(projectRoot, 'node_modules', 'electron')
 
 const log = (msg) => console.log(`[ensure-electron] ${msg}`)
-// Never break `npm install`: any failure just leaves a helpful message.
 const done = (code = 0) => process.exit(code)
 
 if (!existsSync(electronDir)) {
-  log('electron is not installed yet. Run "npm install" first. Skipping.')
-  done()
+  log('electron is not installed. Run "npm install" first.')
+  done(1)
 }
 
 const version = JSON.parse(
@@ -132,12 +131,23 @@ function findCachedZip() {
 function extractWithSystem(zipPath) {
   try {
     if (platform === 'win32') {
-      const ps =
-        `Expand-Archive -Path '${zipPath}' -DestinationPath '${distDir}' -Force`
       const r = spawnSync(
         'powershell',
-        ['-NoProfile', '-ExecutionPolicy', 'Bypass', '-Command', ps],
-        { stdio: 'inherit' }
+        [
+          '-NoProfile',
+          '-ExecutionPolicy',
+          'Bypass',
+          '-Command',
+          'Expand-Archive -LiteralPath $env:COPILOT_ELECTRON_ARCHIVE -DestinationPath $env:COPILOT_ELECTRON_DESTINATION -Force'
+        ],
+        {
+          stdio: 'inherit',
+          env: {
+            ...process.env,
+            COPILOT_ELECTRON_ARCHIVE: zipPath,
+            COPILOT_ELECTRON_DESTINATION: distDir
+          }
+        }
       )
       return r.status === 0
     }
@@ -180,7 +190,10 @@ if (!zip) {
   // Nothing cached: ask Electron to download it the normal way, then re-scan.
   log('No cached download found. Running Electron downloader...')
   const extraNodeOptions =
-    Number(process.versions.node.split('.')[0]) >= 22 ? '--use-system-ca' : ''
+    process.allowedNodeEnvironmentFlags.has('--use-system-ca') &&
+    !/(?:^|\s)--use-system-ca(?:\s|$)/.test(process.env.NODE_OPTIONS ?? '')
+    ? '--use-system-ca'
+    : ''
   spawnSync(process.execPath, [join(electronDir, 'install.js')], {
     cwd: electronDir,
     stdio: 'inherit',
@@ -209,5 +222,4 @@ log('Most likely the download is blocked by a network/proxy. Try one of:')
 log('  • Re-run on a network that allows github.com / electronjs.org, or')
 log('  • Set HTTPS_PROXY and re-run:  npm run setup, or')
 log(`  • Manually place ${zipName} in: ${cacheRoot()} and re-run "npm run setup".`)
-// Exit 0 on purpose so it never breaks `npm install`.
-done(0)
+done(1)

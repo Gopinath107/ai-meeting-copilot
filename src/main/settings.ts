@@ -1,6 +1,6 @@
 import { app } from 'electron'
 import { join } from 'path'
-import { existsSync, readFileSync, writeFileSync } from 'fs'
+import { existsSync, readFileSync, renameSync, unlinkSync, writeFileSync } from 'fs'
 
 /** Full effective configuration (secrets included). Lives in the MAIN process only. */
 export interface AppSettings {
@@ -27,6 +27,39 @@ export interface SettingsStatus {
 const DEFAULT_API_VERSION = '2024-12-01-preview'
 
 let cache: Partial<AppSettings> | null = null
+
+export type SettingsPersistence = {
+  write: (filePath: string, contents: string) => void
+  replace: (temporaryPath: string, destinationPath: string) => void
+  remove: (filePath: string) => void
+}
+
+const filePersistence: SettingsPersistence = {
+  write: (filePath, contents) =>
+    writeFileSync(filePath, contents, { encoding: 'utf-8', mode: 0o600 }),
+  replace: (temporaryPath, destinationPath) => renameSync(temporaryPath, destinationPath),
+  remove: (filePath) => unlinkSync(filePath)
+}
+
+/** Write-then-rename keeps the previous settings intact if serialization/write fails. */
+export function persistSettingsAtomically(
+  destinationPath: string,
+  value: Partial<AppSettings>,
+  persistence: SettingsPersistence = filePersistence
+): void {
+  const temporaryPath = `${destinationPath}.${process.pid}.${Date.now()}.tmp`
+  try {
+    persistence.write(temporaryPath, JSON.stringify(value, null, 2))
+    persistence.replace(temporaryPath, destinationPath)
+  } catch (error) {
+    try {
+      persistence.remove(temporaryPath)
+    } catch {
+      // The temporary file may not have been created, or cleanup may be denied.
+    }
+    throw error
+  }
+}
 
 function settingsFile(): string {
   // Stored in the per-user app data dir so it survives updates and works in a packaged app
@@ -89,10 +122,6 @@ export function saveSettings(partial: Partial<AppSettings>): void {
   if (partial.azureDeployment !== undefined) next.azureDeployment = partial.azureDeployment
   if (partial.azureApiVersion !== undefined) next.azureApiVersion = partial.azureApiVersion
   if (partial.allowInsecureTls !== undefined) next.allowInsecureTls = partial.allowInsecureTls
+  persistSettingsAtomically(settingsFile(), next)
   cache = next
-  try {
-    writeFileSync(settingsFile(), JSON.stringify(next, null, 2), 'utf-8')
-  } catch (error) {
-    console.error('Failed to write settings:', (error as Error).message)
-  }
 }

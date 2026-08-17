@@ -196,6 +196,17 @@ export class DeepgramStream {
     }
   }
 
+  /** Ask Deepgram to finalize the audio received so far without closing yet. */
+  flush(): void {
+    const ws = this.ws
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    try {
+      ws.send(JSON.stringify({ type: 'Finalize' }))
+    } catch {
+      // The socket's error/close callback owns reporting.
+    }
+  }
+
   close(): void {
     if (this.keepAlive) {
       clearInterval(this.keepAlive)

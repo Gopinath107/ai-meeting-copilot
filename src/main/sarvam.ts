@@ -11,6 +11,7 @@ export type TranscriptHandler = (
 export interface AsrStream {
   connect(): void
   send(pcm: ArrayBuffer | Buffer | Uint8Array): void
+  flush(): void
   close(): void
 }
 
@@ -30,11 +31,6 @@ export interface SarvamOptions {
   onOpen?: () => void
   onError?: (error: Error) => void
   onClose?: () => void
-  /**
-   * Behind a corporate TLS-inspection proxy the bundled CA store may reject the
-   * handshake. Set true to opt out of cert verification (default stays secure).
-   */
-  allowInsecureTls?: boolean
 }
 
 /**
@@ -50,6 +46,7 @@ export interface SarvamOptions {
  */
 export class SarvamStream implements AsrStream {
   private ws: WebSocket | null = null
+  private flushSent = false
   private readonly url: string
   private readonly sampleRate: number
 
@@ -60,6 +57,9 @@ export class SarvamStream implements AsrStream {
       model: opts.model ?? 'saaras:v3',
       mode: 'transcribe',
       sample_rate: String(this.sampleRate),
+      // Required by Sarvam before `{ type: 'flush' }` can immediately process
+      // the buffered tail during graceful Stop / End & Minutes.
+      flush_signal: 'true',
       // We stream raw little-endian 16-bit PCM (same bytes as the Deepgram path).
       input_audio_codec: 'pcm_s16le'
     })
@@ -68,8 +68,7 @@ export class SarvamStream implements AsrStream {
 
   connect(): void {
     const ws = new WebSocket(this.url, {
-      headers: { 'api-subscription-key': this.opts.apiKey },
-      rejectUnauthorized: !this.opts.allowInsecureTls
+      headers: { 'api-subscription-key': this.opts.apiKey }
     })
     this.ws = ws
 
@@ -119,17 +118,23 @@ export class SarvamStream implements AsrStream {
     )
   }
 
+  flush(): void {
+    const ws = this.ws
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    try {
+      ws.send(JSON.stringify({ type: 'flush' }))
+      this.flushSent = true
+    } catch {
+      // The socket's error/close callback owns reporting.
+    }
+  }
+
   close(): void {
     const ws = this.ws
+    // Preserve the best-effort behavior of a normal, immediate stop. A graceful
+    // stop calls flush(), waits for final transcripts, and only then calls close().
+    if (!this.flushSent && ws && ws.readyState === WebSocket.OPEN) this.flush()
     this.ws = null
-    if (ws && ws.readyState === WebSocket.OPEN) {
-      try {
-        // Flush buffered audio so the final utterance is transcribed before close.
-        ws.send(JSON.stringify({ type: 'flush' }))
-      } catch {
-        // ignore
-      }
-    }
     ws?.close()
   }
 }

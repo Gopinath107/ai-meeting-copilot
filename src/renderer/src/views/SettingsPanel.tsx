@@ -42,20 +42,46 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
   const [allowInsecureTls, setAllowInsecureTls] = useState(false)
   const [saving, setSaving] = useState(false)
   const [saved, setSaved] = useState(false)
+  const [error, setError] = useState('')
 
   useEffect(() => {
-    void window.api.getSettings().then((s) => {
-      setStatus(s)
-      setAzureEndpoint(s.azureEndpoint)
-      setAzureDeployment(s.azureDeployment)
-      setAzureApiVersion(s.azureApiVersion)
-      setAllowInsecureTls(s.allowInsecureTls)
-    })
+    let active = true
+    void window.api
+      .getSettings()
+      .then((s) => {
+        if (!active) return
+        setStatus(s)
+        setAzureEndpoint(s.azureEndpoint)
+        setAzureDeployment(s.azureDeployment)
+        setAzureApiVersion(s.azureApiVersion)
+        setAllowInsecureTls(s.allowInsecureTls)
+      })
+      .catch((reason: unknown) => {
+        if (!active) return
+        setError(reason instanceof Error ? reason.message : 'Settings could not be loaded.')
+      })
+    return () => {
+      active = false
+    }
   }, [])
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent): void => {
+      if (event.key === 'Escape') onClose()
+    }
+    window.addEventListener('keydown', onKeyDown)
+    return () => window.removeEventListener('keydown', onKeyDown)
+  }, [onClose])
+
+  function markEdited(): void {
+    setSaved(false)
+    setError('')
+  }
 
   async function save(): Promise<void> {
     setSaving(true)
     setSaved(false)
+    setError('')
     try {
       const next = await window.api.saveSettings({
         sarvamApiKey: sarvamApiKey || undefined,
@@ -71,13 +97,20 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
       setDeepgramApiKey('')
       setAzureApiKey('')
       setSaved(true)
+    } catch (reason) {
+      setError(reason instanceof Error ? reason.message : 'Settings could not be saved.')
     } finally {
       setSaving(false)
     }
   }
 
   return (
-    <div className="no-drag absolute inset-0 z-20 flex flex-col bg-zinc-900/95 backdrop-blur-sm">
+    <div
+      role="dialog"
+      aria-modal="true"
+      aria-label="API settings"
+      className="no-drag absolute inset-0 z-20 flex flex-col bg-zinc-900/95 backdrop-blur-sm"
+    >
       {/* Header */}
       <div className="flex items-center justify-between border-b border-white/10 px-4 py-3">
         <span className="text-sm font-semibold text-zinc-100">Settings · API keys</span>
@@ -111,7 +144,10 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             <input
               type="password"
               value={sarvamApiKey}
-              onChange={(e) => setSarvamApiKey(e.target.value)}
+              onChange={(e) => {
+                markEdited()
+                setSarvamApiKey(e.target.value)
+              }}
               placeholder={status?.sarvamKeySet ? '•••••••••• saved' : 'Paste Sarvam AI API key'}
               className={inputClass}
               autoComplete="off"
@@ -130,7 +166,10 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             <input
               type="password"
               value={deepgramApiKey}
-              onChange={(e) => setDeepgramApiKey(e.target.value)}
+              onChange={(e) => {
+                markEdited()
+                setDeepgramApiKey(e.target.value)
+              }}
               placeholder={status?.deepgramKeySet ? '•••••••••• saved' : 'Paste Deepgram API key'}
               className={inputClass}
               autoComplete="off"
@@ -147,7 +186,10 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
             <input
               type="password"
               value={azureApiKey}
-              onChange={(e) => setAzureApiKey(e.target.value)}
+              onChange={(e) => {
+                markEdited()
+                setAzureApiKey(e.target.value)
+              }}
               placeholder={status?.azureKeySet ? '•••••••••• saved' : 'Paste Azure OpenAI API key'}
               className={inputClass}
               autoComplete="off"
@@ -156,16 +198,25 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
           <Field label="Endpoint">
             <input
               value={azureEndpoint}
-              onChange={(e) => setAzureEndpoint(e.target.value)}
+              onChange={(e) => {
+                markEdited()
+                setAzureEndpoint(e.target.value)
+              }}
               placeholder="https://your-resource.openai.azure.com"
               className={inputClass}
               autoComplete="off"
             />
           </Field>
-          <Field label="Deployment name">
+          <Field
+            label="Deployment name"
+            hint="Screen-aware answers require an Azure deployment that accepts image/vision input."
+          >
             <input
               value={azureDeployment}
-              onChange={(e) => setAzureDeployment(e.target.value)}
+              onChange={(e) => {
+                markEdited()
+                setAzureDeployment(e.target.value)
+              }}
               placeholder="e.g. rudhra-gpt-5.4-mini"
               className={inputClass}
               autoComplete="off"
@@ -174,7 +225,10 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
           <Field label="API version">
             <input
               value={azureApiVersion}
-              onChange={(e) => setAzureApiVersion(e.target.value)}
+              onChange={(e) => {
+                markEdited()
+                setAzureApiVersion(e.target.value)
+              }}
               placeholder="2024-12-01-preview"
               className={inputClass}
               autoComplete="off"
@@ -186,23 +240,31 @@ export default function SettingsPanel({ onClose }: { onClose: () => void }) {
           <input
             type="checkbox"
             checked={allowInsecureTls}
-            onChange={(e) => setAllowInsecureTls(e.target.checked)}
+            onChange={(e) => {
+              markEdited()
+              setAllowInsecureTls(e.target.checked)
+            }}
             className="mt-0.5"
           />
           <span className="text-[11px] text-zinc-400">
             <span className="font-medium text-zinc-200">Allow insecure TLS for Deepgram.</span> Only
             enable this on a trusted corporate network that inspects HTTPS traffic and breaks the
-            certificate chain. Disables certificate verification for the speech connection.
+            certificate chain. Sarvam certificate verification remains enabled.
           </span>
         </label>
       </div>
 
       {/* Footer */}
       <div className="flex items-center justify-between border-t border-white/10 px-4 py-3">
-        <span className="text-[11px] text-emerald-300">{saved ? 'Saved.' : ''}</span>
+        <span
+          role={error ? 'alert' : 'status'}
+          className={`text-[11px] ${error ? 'text-red-300' : 'text-emerald-300'}`}
+        >
+          {error || (saved ? 'Saved.' : '')}
+        </span>
         <button
           onClick={() => void save()}
-          disabled={saving}
+          disabled={saving || status === null}
           className="rounded-lg bg-indigo-500 px-4 py-2 text-sm font-semibold text-white transition hover:bg-indigo-400 disabled:opacity-50"
         >
           {saving ? 'Saving…' : 'Save'}

@@ -1,4 +1,12 @@
 import { contextBridge, ipcRenderer } from 'electron'
+import type {
+  AiAskRequest,
+  AiDoneEvent,
+  AiErrorEvent,
+  AiTokenEvent
+} from '../shared/ai'
+import type { AudioStopResult, DisplaySourceInfo, PickedDocs } from '../shared/capture'
+export type { AudioStopResult, DisplaySourceInfo, PickedDocs } from '../shared/capture'
 
 export type HotkeyPayload = { action: string; value?: unknown }
 export type KeyStatus = { deepgram: boolean; azureOpenAI: boolean }
@@ -11,8 +19,6 @@ export type TranscriptUpdate = {
   confidence?: number
 }
 export type TranscriptStatus = { source: TranscriptSource; status: string; message?: string }
-export type AiMessage = { role: 'system' | 'user' | 'assistant'; content: string }
-export type PickedDocs = { names: string[]; text: string }
 export type SettingsStatus = {
   sarvamKeySet: boolean
   deepgramKeySet: boolean
@@ -40,6 +46,10 @@ const api = {
     ipcRenderer.invoke('settings:save', input),
   pickDocument: (kind: 'resume' | 'extra'): Promise<PickedDocs | null> =>
     ipcRenderer.invoke('docs:pick', kind),
+  listDisplaySources: (): Promise<DisplaySourceInfo[]> =>
+    ipcRenderer.invoke('display:listSources'),
+  selectDisplaySource: (sourceId: string): Promise<DisplaySourceInfo> =>
+    ipcRenderer.invoke('display:selectSource', sourceId),
   copyText: (text: string): Promise<boolean> => ipcRenderer.invoke('clipboard:write', text),
   hide: (): void => ipcRenderer.send('window:hide'),
   quit: (): void => ipcRenderer.send('window:quit'),
@@ -53,7 +63,10 @@ const api = {
     ipcRenderer.send('audio:chunk', kind, buffer),
   audioStart: (mic: boolean, provider?: 'auto' | 'deepgram' | 'sarvam', keyterms?: string[]): void =>
     ipcRenderer.send('audio:start', mic, provider ?? 'auto', keyterms ?? []),
+  audioSetMic: (enabled: boolean): void => ipcRenderer.send('audio:setMic', enabled),
   audioStop: (): void => ipcRenderer.send('audio:stop'),
+  audioStopGracefully: (timeoutMs = 1800): Promise<AudioStopResult> =>
+    ipcRenderer.invoke('audio:stopGracefully', timeoutMs),
   onAudioStats: (callback: (stats: { system: number; mic: number }) => void): (() => void) => {
     const listener = (_event: unknown, stats: { system: number; mic: number }): void =>
       callback(stats)
@@ -78,20 +91,20 @@ const api = {
     return () => ipcRenderer.removeListener('stealth:changed', listener)
   },
   hasAiConfig: (): Promise<boolean> => ipcRenderer.invoke('ai:hasConfig'),
-  aiAsk: (messages: AiMessage[]): void => ipcRenderer.send('ai:ask', messages),
-  aiCancel: (): void => ipcRenderer.send('ai:cancel'),
-  onAiToken: (callback: (text: string) => void): (() => void) => {
-    const listener = (_event: unknown, text: string): void => callback(text)
+  aiAsk: (request: AiAskRequest): void => ipcRenderer.send('ai:ask', request),
+  aiCancel: (requestId?: string): void => ipcRenderer.send('ai:cancel', requestId),
+  onAiToken: (callback: (event: AiTokenEvent) => void): (() => void) => {
+    const listener = (_event: unknown, event: AiTokenEvent): void => callback(event)
     ipcRenderer.on('ai:token', listener)
     return () => ipcRenderer.removeListener('ai:token', listener)
   },
-  onAiDone: (callback: () => void): (() => void) => {
-    const listener = (): void => callback()
+  onAiDone: (callback: (event: AiDoneEvent) => void): (() => void) => {
+    const listener = (_event: unknown, event: AiDoneEvent): void => callback(event)
     ipcRenderer.on('ai:done', listener)
     return () => ipcRenderer.removeListener('ai:done', listener)
   },
-  onAiError: (callback: (message: string) => void): (() => void) => {
-    const listener = (_event: unknown, message: string): void => callback(message)
+  onAiError: (callback: (event: AiErrorEvent) => void): (() => void) => {
+    const listener = (_event: unknown, event: AiErrorEvent): void => callback(event)
     ipcRenderer.on('ai:error', listener)
     return () => ipcRenderer.removeListener('ai:error', listener)
   }

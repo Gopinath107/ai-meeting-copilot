@@ -3,6 +3,23 @@ import ReactMarkdown from 'react-markdown'
 import remarkGfm from 'remark-gfm'
 import type { Components } from 'react-markdown'
 
+const SAFE_EXTERNAL_PROTOCOLS = new Set(['http:', 'https:', 'mailto:'])
+
+/**
+ * AI output is untrusted. Only links that explicitly target a normal web or
+ * email URL may leave the Electron renderer; relative paths, file URLs and
+ * custom protocols are deliberately blocked.
+ */
+export function safeExternalHref(value?: string): string | undefined {
+  if (!value) return undefined
+  try {
+    const url = new URL(value)
+    return SAFE_EXTERNAL_PROTOCOLS.has(url.protocol) ? url.href : undefined
+  } catch {
+    return undefined
+  }
+}
+
 /**
  * Renders the AI answer as formatted Markdown so coding answers show real code
  * blocks and lists show as proper bullet/numbered points instead of one mixed
@@ -28,10 +45,27 @@ const components: Components = {
   h3: ({ children }) => (
     <h3 className="mb-1 mt-2 text-[13px] font-semibold text-indigo-200 first:mt-0">{children}</h3>
   ),
-  a: ({ children, href }) => (
-    <a href={href} className="text-indigo-300 underline" target="_blank" rel="noreferrer">
-      {children}
-    </a>
+  a: ({ children, href }) => {
+    const safeHref = safeExternalHref(href)
+    return safeHref ? (
+      <a
+        href={safeHref}
+        className="text-indigo-300 underline"
+        target="_blank"
+        rel="noopener noreferrer"
+      >
+        {children}
+      </a>
+    ) : (
+      <span className="text-zinc-300" title="Unsafe link blocked">
+        {children}
+      </span>
+    )
+  },
+  img: ({ alt }) => (
+    <span className="rounded bg-white/5 px-1.5 py-0.5 text-[11px] text-zinc-400">
+      [Remote image blocked{alt ? `: ${alt}` : ''}]
+    </span>
   ),
   blockquote: ({ children }) => (
     <blockquote className="mb-2 border-l-2 border-indigo-400/40 pl-2 text-zinc-300 last:mb-0">
@@ -65,7 +99,12 @@ const components: Components = {
 
 function MarkdownImpl({ children }: { children: string }): React.JSX.Element {
   return (
-    <ReactMarkdown remarkPlugins={[remarkGfm]} components={components}>
+    <ReactMarkdown
+      remarkPlugins={[remarkGfm]}
+      components={components}
+      skipHtml
+      urlTransform={(url) => safeExternalHref(url) ?? ''}
+    >
       {children}
     </ReactMarkdown>
   )
