@@ -20,20 +20,57 @@ import { DeepgramStream } from './deepgram'
 import { SarvamStream, type AsrStream } from './sarvam'
 import {
   AsrSessionManager,
+  isPermanentAsrFailure,
+  nextReconnectAttempt,
+  reconnectDelayMs,
+  resolveAsrProviderPlan,
   waitForFinalTranscriptSettle,
   type AsrKind,
   type AsrSessionSnapshot
 } from './asrSession'
 import { streamChat, getAzureConfig, type ChatMessage } from './azure'
-import { getSettings, getSettingsStatus, saveSettings, type AppSettings } from './settings'
+import {
+  getSettings,
+  getSettingsStatus,
+  saveSettings,
+  type AppSettings,
+  type SettingsUpdate
+} from './settings'
 import { extractDocxTextInWorker } from './docxParser'
+import { registerShortcutSet, type ShortcutSpec } from './shortcutRegistry'
+import { readPackagedBuildMetadata } from './buildMetadata'
+import { createProductionUpdateCoordinator } from './productionUpdater'
 import type { AiAskRequest, AiTextMessage, ScreenshotContext } from '../shared/ai'
-import type { AudioStopResult, DisplaySourceInfo, PickedDocs } from '../shared/capture'
+import { outputTokenBudgetForIntent } from '../shared/aiPolicy'
+import type { UpdateStatus } from '../shared/release'
+import type {
+  AudioStopResult,
+  DisplaySourceInfo,
+  PickedDocs,
+  ShortcutHealth,
+  SpeechConnectionState,
+  SpeechHealth,
+  SpeechSourceStartResult,
+  SpeechStartResult,
+  TranscriptSource
+} from '../shared/capture'
 
 dotenv.config()
 
+// Keep every renderer sandboxed, including windows added in the future. The
+// preload uses only contextBridge/ipcRenderer APIs supported by sandboxed
+// preload scripts.
+app.enableSandbox()
+
+// Installer completion can launch the app before a user clicks its desktop
+// shortcut. Without a process lock, the invisible first instance owns all
+// global shortcuts and the visible second instance appears broken.
+const hasSingleInstanceLock = app.requestSingleInstanceLock()
+if (!hasSingleInstanceLock) app.quit()
+
 let overlayWindow: BrowserWindow | null = null
 let tray: Tray | null = null
+let updateCoordinator: ReturnType<typeof createProductionUpdateCoordinator> | null = null
 let clickThrough = false
 let stealthOn = true
 // Guards reassertStealth() against re-entrancy (showInactive re-fires 'show').
@@ -53,10 +90,36 @@ let asrProvider: AsrProvider = 'auto'
 // Domain terms (tech stack / product names) to bias Deepgram recognition toward
 // so meeting jargon isn't misheard. Set per session from the renderer.
 let asrKeyterms: string[] = []
-const asrSessions = new AsrSessionManager<AsrStream>()
 const finalTranscriptCounts = new Map<string, number>()
 const finalTranscriptListeners = new Set<(kind: AsrKind, generation: number) => void>()
+const asrSessions = new AsrSessionManager<AsrStream>((kind, generation) => {
+  finalTranscriptCounts.delete(`${kind}:${generation}`)
+})
 let selectedDisplaySource: { id: string; displayId: string } | null = null
+let shortcutHealth: ShortcutHealth = {
+  registered: 0,
+  total: 4,
+  allRegistered: false,
+  checkedAt: Date.now(),
+  shortcuts: []
+}
+
+const idleSpeechStatus = (source: TranscriptSource) => ({
+  source,
+  status: 'idle' as const,
+  updatedAt: Date.now()
+})
+const speechHealth: SpeechHealth = {
+  interviewer: idleSpeechStatus('interviewer'),
+  you: idleSpeechStatus('you')
+}
+
+type StartAcknowledgement = {
+  generation: number
+  resolve: (result: SpeechSourceStartResult) => void
+  timer: ReturnType<typeof setTimeout>
+}
+const startAcknowledgements = new Map<AsrKind, StartAcknowledgement>()
 
 const DOCUMENT_EXTENSIONS = new Set(['.pdf', '.docx', '.txt', '.md'])
 const MAX_EXTRA_DOCUMENTS = 8
@@ -84,6 +147,8 @@ function createOverlayWindow(): void {
   overlayWindow = new BrowserWindow({
     width,
     height,
+    minWidth: 420,
+    minHeight: 560,
     x: workAreaSize.width - width - 24,
     y: 24,
     show: false,
@@ -101,7 +166,7 @@ function createOverlayWindow(): void {
     autoHideMenuBar: true,
     webPreferences: {
       preload: join(__dirname, '../preload/index.js'),
-      sandbox: false,
+      sandbox: true,
       contextIsolation: true,
       nodeIntegration: false
     }
@@ -117,11 +182,10 @@ function createOverlayWindow(): void {
   overlayWindow.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
 
   overlayWindow.on('ready-to-show', () => {
-    overlayWindow?.show()
-    // Content protection must be (re)applied AFTER the native window exists and
-    // is shown — setting it while show:false can fail to bind to the HWND, which
-    // is why the overlay could still leak into a screen share. Re-assert here.
-    reassertStealth()
+    // Applies protection on both sides of the first show, so the overlay is never
+    // presented — not even for one frame — without capture exclusion bound to the
+    // HWND. Setting it while show:false can fail to bind, hence the re-apply.
+    showOverlayProtected()
   })
 
   // Windows can reset the capture-exclusion affinity when a window is re-shown
@@ -139,6 +203,15 @@ function createOverlayWindow(): void {
     return { action: 'deny' }
   })
 
+  overlayWindow.webContents.on('did-finish-load', () => {
+    sendShortcutHealth()
+    overlayWindow?.webContents.send('transcript:status', speechHealth.interviewer)
+    overlayWindow?.webContents.send('transcript:status', speechHealth.you)
+    if (updateCoordinator) {
+      overlayWindow?.webContents.send('updates:status', updateCoordinator.currentStatus)
+    }
+  })
+
   if (!app.isPackaged && process.env['ELECTRON_RENDERER_URL']) {
     overlayWindow.loadURL(process.env['ELECTRON_RENDERER_URL'])
   } else {
@@ -149,14 +222,18 @@ function createOverlayWindow(): void {
 function toggleVisibility(): void {
   if (!overlayWindow) return
   if (overlayWindow.isVisible()) overlayWindow.hide()
-  else overlayWindow.show()
+  else showOverlayProtected()
 }
 
 function toggleClickThrough(): void {
-  if (!overlayWindow) return
-  clickThrough = !clickThrough
-  overlayWindow.setIgnoreMouseEvents(clickThrough, { forward: true })
-  overlayWindow.webContents.send('hotkey', { action: 'click-through', value: clickThrough })
+  applyClickThrough(!clickThrough)
+}
+
+function applyClickThrough(value: boolean): void {
+  clickThrough = value
+  overlayWindow?.setIgnoreMouseEvents(value, { forward: true })
+  overlayWindow?.webContents.send('hotkey', { action: 'click-through', value })
+  updateTrayMenu()
 }
 
 /**
@@ -195,43 +272,163 @@ function applyStealth(value: boolean): void {
   tray?.setToolTip(`Interview Copilot — ${value ? 'stealth ON (invisible)' : 'visible'}`)
 }
 
+/**
+ * The ONLY way the overlay is allowed to become visible.
+ *
+ * Windows applies capture exclusion to the HWND, not to the pixels, so a window
+ * that is shown first and protected afterwards can present one unprotected frame
+ * before the affinity lands — seen in a screen share or recording as a flash of
+ * the overlay every time it is re-opened with Ctrl+Shift+Space. Protection is
+ * therefore applied BEFORE the window is presented, and re-applied after, because
+ * Windows can also clear the affinity across a hide/show cycle.
+ */
+function showOverlayProtected(focus = true): void {
+  const win = overlayWindow
+  if (!win || win.isDestroyed()) return
+
+  win.setContentProtection(stealthOn)
+  win.setAlwaysOnTop(true, 'screen-saver')
+  win.setVisibleOnAllWorkspaces(true, { visibleOnFullScreen: true })
+
+  // The 'show' listener re-enters reassertStealth(), whose showInactive() would
+  // drop the focus this call is meant to hand over. Protection is applied on both
+  // sides of the show here, so suppressing that re-entry loses nothing.
+  reassertingStealth = true
+  try {
+    if (focus) {
+      win.show()
+      win.focus()
+    } else {
+      win.showInactive()
+    }
+  } finally {
+    reassertingStealth = false
+  }
+
+  win.setContentProtection(stealthOn)
+  // reassertStealth() normally repaints on 'show'; it was suppressed above, so
+  // force the repaint here or a re-opened overlay can present a stale frame.
+  win.webContents.invalidate()
+}
+
 function showOverlay(): void {
   if (!overlayWindow) {
     createOverlayWindow()
     return
   }
-  overlayWindow.show()
-  overlayWindow.focus()
+  showOverlayProtected()
 }
 
-function safeRegister(accelerator: string, handler: () => void): void {
-  try {
-    const ok = globalShortcut.register(accelerator, handler)
-    if (!ok) console.warn(`Failed to register hotkey: ${accelerator}`)
-  } catch (error) {
-    console.warn(`Invalid hotkey ${accelerator}:`, error)
+function shortcutDefinitions(): ShortcutSpec[] {
+  return [
+    {
+      id: 'toggle-overlay',
+      label: 'Show or hide overlay',
+      accelerator: 'CommandOrControl+Shift+Space',
+      handler: toggleVisibility
+    },
+    {
+      id: 'hide-overlay',
+      label: 'Hide overlay',
+      accelerator: 'CommandOrControl+Shift+H',
+      handler: () => overlayWindow?.hide()
+    },
+    {
+      id: 'click-through',
+      label: 'Toggle click-through',
+      accelerator: 'CommandOrControl+Shift+\\',
+      handler: toggleClickThrough
+    },
+    {
+      id: 'ask',
+      label: 'Ask AI',
+      accelerator: 'CommandOrControl+Shift+Enter',
+      handler: () => {
+        showOverlay()
+        overlayWindow?.webContents.send('hotkey', { action: 'ask' })
+      }
+    }
+  ]
+}
+
+function sendShortcutHealth(): void {
+  if (overlayWindow && !overlayWindow.isDestroyed() && !overlayWindow.webContents.isDestroyed()) {
+    overlayWindow.webContents.send('shortcuts:status', shortcutHealth)
   }
 }
 
-function registerHotkeys(): void {
-  // Toggle the overlay on/off instantly
-  safeRegister('CommandOrControl+Shift+Space', toggleVisibility)
-  // Panic hide
-  safeRegister('CommandOrControl+Shift+H', () => overlayWindow?.hide())
-  // Make the overlay click-through (mouse passes to the app behind it)
-  safeRegister('CommandOrControl+Shift+\\', toggleClickThrough)
-  // Ask the AI for an answer (wired to the LLM in a later phase)
-  safeRegister('CommandOrControl+Shift+Enter', () => {
-    overlayWindow?.webContents.send('hotkey', { action: 'ask' })
-  })
+function registerHotkeys(): ShortcutHealth {
+  const definitions = shortcutDefinitions()
+  shortcutHealth = registerShortcutSet(globalShortcut, definitions)
+  for (const shortcut of shortcutHealth.shortcuts) {
+    if (!shortcut.registered) {
+      console.warn(`Failed to register hotkey ${shortcut.accelerator}: ${shortcut.error}`)
+    }
+  }
+  sendShortcutHealth()
+  updateTrayMenu()
+  return shortcutHealth
 }
 
 function sendTranscriptStatus(
-  source: 'interviewer' | 'you',
-  status: string,
-  message?: string
+  source: TranscriptSource,
+  status: SpeechConnectionState,
+  message?: string,
+  provider?: 'deepgram' | 'sarvam',
+  attempt?: number
 ): void {
-  overlayWindow?.webContents.send('transcript:status', { source, status, message })
+  const next = {
+    source,
+    status,
+    ...(message ? { message } : {}),
+    ...(provider ? { provider } : {}),
+    ...(attempt ? { attempt } : {}),
+    updatedAt: Date.now()
+  }
+  speechHealth[source] = next
+  overlayWindow?.webContents.send('transcript:status', next)
+}
+
+function settleStart(
+  kind: AsrKind,
+  generation: number,
+  result: SpeechSourceStartResult
+): void {
+  const acknowledgement = startAcknowledgements.get(kind)
+  if (!acknowledgement || acknowledgement.generation !== generation) return
+  clearTimeout(acknowledgement.timer)
+  startAcknowledgements.delete(kind)
+  acknowledgement.resolve(result)
+}
+
+function beginStartAcknowledgement(
+  kind: AsrKind,
+  source: TranscriptSource,
+  generation: number
+): Promise<SpeechSourceStartResult> {
+  const previous = startAcknowledgements.get(kind)
+  if (previous) {
+    clearTimeout(previous.timer)
+    previous.resolve({ source, state: 'error', message: 'Speech start was superseded' })
+  }
+  return new Promise((resolve) => {
+    const timer = setTimeout(() => {
+      if (startAcknowledgements.get(kind)?.generation !== generation) return
+      startAcknowledgements.delete(kind)
+      resolve({
+        source,
+        state: 'error',
+        message: 'Speech service did not become ready within 15 seconds'
+      })
+    }, 15_000)
+    startAcknowledgements.set(kind, { generation, resolve, timer })
+  })
+}
+
+function pendingAudioMessage(droppedBytes: number): string | undefined {
+  if (droppedBytes <= 0) return undefined
+  const seconds = droppedBytes / (SAMPLE_RATE * 2)
+  return `${seconds.toFixed(1)}s of oldest audio was skipped while reconnecting`
 }
 
 function sendTranscript(
@@ -261,10 +458,18 @@ function sendTranscript(
 
 function startDeepgram(
   kind: AsrKind,
-  source: 'interviewer' | 'you',
+  source: TranscriptSource,
   apiKey: string,
-  generation: number
+  generation: number,
+  attempt = 0,
+  seedAudio: Buffer[] = [],
+  droppedBytes = 0,
+  delayMs = 0
 ): void {
+  let openedAt: number | null = null
+  let sawTranscript = false
+  let restarted = false
+  let connectionTimer: ReturnType<typeof setTimeout> | null = null
   const stream = new DeepgramStream({
     apiKey,
     sampleRate: SAMPLE_RATE,
@@ -272,36 +477,105 @@ function startDeepgram(
     allowInsecureTls: getSettings().allowInsecureTls,
     onOpen: () => {
       if (!asrSessions.isCurrent(kind, generation, stream)) return
+      if (connectionTimer) clearTimeout(connectionTimer)
+      connectionTimer = null
+      openedAt = Date.now()
       if (asrSessions.isIntentionalClose(kind, generation, stream)) {
         stream.flush()
       } else {
-        sendTranscriptStatus(source, 'connected', 'Deepgram')
+        const dropped = droppedBytes + stream.takeDroppedAudioBytes()
+        sendTranscriptStatus(
+          source,
+          'connected',
+          pendingAudioMessage(dropped) ?? 'Deepgram ready',
+          'deepgram'
+        )
+        settleStart(kind, generation, { source, state: 'connected', provider: 'deepgram' })
       }
     },
-    onTranscript: (text, isFinal, speaker, confidence) =>
-      sendTranscript(kind, source, generation, stream, text, isFinal, speaker, confidence),
+    onTranscript: (text, isFinal, speaker, confidence) => {
+      if (text.trim()) sawTranscript = true
+      sendTranscript(kind, source, generation, stream, text, isFinal, speaker, confidence)
+    },
     onError: (error) => {
       if (!asrSessions.isCurrent(kind, generation, stream)) return
       console.error(`Deepgram ${kind} error:`, error.message)
-      if (!asrSessions.isIntentionalClose(kind, generation, stream)) {
-        sendTranscriptStatus(source, 'error', error.message)
-      }
+      restart(error.message)
     },
     onClose: () => {
       if (!asrSessions.isCurrent(kind, generation, stream)) return
-      const intentional = asrSessions.isIntentionalClose(kind, generation, stream)
-      asrSessions.clearIfCurrent(kind, generation, stream)
-      if (!intentional) sendTranscriptStatus(source, 'closed')
+      if (connectionTimer) clearTimeout(connectionTimer)
+      connectionTimer = null
+      if (asrSessions.isIntentionalClose(kind, generation, stream)) {
+        asrSessions.clearIfCurrent(kind, generation, stream)
+        return
+      }
+      restart('connection closed')
     }
   })
-  if (!asrSessions.install(kind, generation, stream)) return
-  try {
-    stream.connect()
-  } catch (error) {
-    asrSessions.clearIfCurrent(kind, generation, stream)
-    stream.close()
-    sendTranscriptStatus(source, 'error', (error as Error).message)
+
+  const restart = (reason: string): void => {
+    if (
+      restarted ||
+      !asrSessions.isCurrent(kind, generation, stream) ||
+      asrSessions.isIntentionalClose(kind, generation, stream)
+    ) {
+      return
+    }
+    restarted = true
+    if (connectionTimer) clearTimeout(connectionTimer)
+    if (isPermanentAsrFailure(reason)) {
+      asrSessions.clearIfCurrent(kind, generation, stream)
+      finalTranscriptCounts.delete(`${kind}:${generation}`)
+      stream.close()
+      sendTranscriptStatus(source, 'error', `Deepgram rejected the connection: ${reason}`, 'deepgram')
+      settleStart(kind, generation, {
+        source,
+        state: 'error',
+        provider: 'deepgram',
+        message: reason
+      })
+      return
+    }
+    const pending = stream.takePendingAudio()
+    const dropped = droppedBytes + stream.takeDroppedAudioBytes()
+    const nextAttempt = nextReconnectAttempt(attempt, openedAt, sawTranscript)
+    const retryInMs = reconnectDelayMs(nextAttempt)
+    sendTranscriptStatus(
+      source,
+      'reconnecting',
+      `Deepgram interrupted (${reason}); retrying in ${(retryInMs / 1000).toFixed(1)}s`,
+      'deepgram',
+      nextAttempt
+    )
+    startDeepgram(
+      kind,
+      source,
+      apiKey,
+      generation,
+      nextAttempt,
+      pending,
+      dropped,
+      retryInMs
+    )
   }
+
+  if (!asrSessions.install(kind, generation, stream)) return
+  for (const chunk of seedAudio) stream.send(chunk)
+  if (attempt === 0) {
+    sendTranscriptStatus(source, 'connecting', 'Connecting to Deepgram...', 'deepgram')
+  }
+  const connect = (): void => {
+    if (!asrSessions.isCurrent(kind, generation, stream)) return
+    try {
+      stream.connect()
+      connectionTimer = setTimeout(() => restart('connection timed out'), 10_000)
+    } catch (error) {
+      restart((error as Error).message)
+    }
+  }
+  if (delayMs > 0) setTimeout(connect, delayMs)
+  else connect()
 }
 
 /**
@@ -311,26 +585,21 @@ function startDeepgram(
  */
 function startSarvam(
   kind: AsrKind,
-  source: 'interviewer' | 'you',
+  source: TranscriptSource,
   sarvamApiKey: string,
   deepgramApiKey: string,
   generation: number,
-  codeMixed = false
+  allowDeepgramFallback: boolean,
+  codeMixed = false,
+  attempt = 0,
+  seedAudio: Buffer[] = [],
+  droppedBytes = 0,
+  delayMs = 0
 ): void {
-  let opened = false
-  let switched = false
-  const fallback = (reason: string): void => {
-    if (switched || opened || !asrSessions.canFallback(kind, generation, stream)) return
-    switched = true
-    if (!deepgramApiKey) {
-      asrSessions.clearIfCurrent(kind, generation, stream)
-      sendTranscriptStatus(source, 'error', `Sarvam unavailable (${reason}); no Deepgram fallback`)
-      return
-    }
-    console.warn(`Sarvam ${kind} failed (${reason}) — falling back to Deepgram`)
-    sendTranscriptStatus(source, 'connecting', 'Sarvam unavailable — using Deepgram')
-    startDeepgram(kind, source, deepgramApiKey, generation)
-  }
+  let openedAt: number | null = null
+  let sawTranscript = false
+  let restarted = false
+  let connectionTimer: ReturnType<typeof setTimeout> | null = null
   const stream = new SarvamStream({
     apiKey: sarvamApiKey,
     sampleRate: SAMPLE_RATE,
@@ -340,89 +609,207 @@ function startSarvam(
     language: codeMixed ? 'unknown' : 'en-IN',
     onOpen: () => {
       if (!asrSessions.isCurrent(kind, generation, stream)) return
-      opened = true
+      if (connectionTimer) clearTimeout(connectionTimer)
+      connectionTimer = null
+      openedAt = Date.now()
       if (asrSessions.isIntentionalClose(kind, generation, stream)) {
         stream.flush()
       } else {
-        sendTranscriptStatus(source, 'connected', 'Sarvam')
+        const dropped = droppedBytes + stream.takeDroppedAudioBytes()
+        sendTranscriptStatus(
+          source,
+          'connected',
+          pendingAudioMessage(dropped) ?? 'Sarvam ready',
+          'sarvam'
+        )
+        settleStart(kind, generation, { source, state: 'connected', provider: 'sarvam' })
       }
     },
-    onTranscript: (text, isFinal, speaker, confidence) =>
-      sendTranscript(kind, source, generation, stream, text, isFinal, speaker, confidence),
+    onTranscript: (text, isFinal, speaker, confidence) => {
+      if (text.trim()) sawTranscript = true
+      sendTranscript(kind, source, generation, stream, text, isFinal, speaker, confidence)
+    },
     onError: (error) => {
       if (!asrSessions.isCurrent(kind, generation, stream)) return
       console.error(`Sarvam ${kind} error:`, error.message)
       if (asrSessions.isIntentionalClose(kind, generation, stream)) return
-      if (opened) sendTranscriptStatus(source, 'error', error.message)
-      else fallback(error.message)
+      restart(error.message)
     },
     onClose: () => {
       if (!asrSessions.isCurrent(kind, generation, stream)) return
+      if (connectionTimer) clearTimeout(connectionTimer)
+      connectionTimer = null
       if (asrSessions.isIntentionalClose(kind, generation, stream)) {
         asrSessions.clearIfCurrent(kind, generation, stream)
-      } else if (opened) {
-        asrSessions.clearIfCurrent(kind, generation, stream)
-        sendTranscriptStatus(source, 'closed')
       } else {
-        fallback('connection closed')
+        restart('connection closed')
       }
     }
   })
+
+  const restart = (reason: string): void => {
+    if (
+      restarted ||
+      !asrSessions.canFallback(kind, generation, stream) ||
+      asrSessions.isIntentionalClose(kind, generation, stream)
+    ) {
+      return
+    }
+    restarted = true
+    if (connectionTimer) clearTimeout(connectionTimer)
+    const pending = stream.takePendingAudio()
+    const dropped = droppedBytes + stream.takeDroppedAudioBytes()
+    if (allowDeepgramFallback && deepgramApiKey) {
+      console.warn(`Sarvam ${kind} failed (${reason}) — falling back to Deepgram`)
+      sendTranscriptStatus(
+        source,
+        'reconnecting',
+        `Sarvam interrupted (${reason}); switching to Deepgram`,
+        'deepgram',
+        1
+      )
+      startDeepgram(kind, source, deepgramApiKey, generation, 0, pending, dropped)
+      return
+    }
+    if (isPermanentAsrFailure(reason)) {
+      asrSessions.clearIfCurrent(kind, generation, stream)
+      finalTranscriptCounts.delete(`${kind}:${generation}`)
+      stream.close()
+      sendTranscriptStatus(source, 'error', `Sarvam rejected the connection: ${reason}`, 'sarvam')
+      settleStart(kind, generation, {
+        source,
+        state: 'error',
+        provider: 'sarvam',
+        message: reason
+      })
+      return
+    }
+    const nextAttempt = nextReconnectAttempt(attempt, openedAt, sawTranscript)
+    const retryInMs = reconnectDelayMs(nextAttempt)
+    sendTranscriptStatus(
+      source,
+      'reconnecting',
+      `Sarvam interrupted (${reason}); retrying in ${(retryInMs / 1000).toFixed(1)}s`,
+      'sarvam',
+      nextAttempt
+    )
+    startSarvam(
+      kind,
+      source,
+      sarvamApiKey,
+      deepgramApiKey,
+      generation,
+      false,
+      codeMixed,
+      nextAttempt,
+      pending,
+      dropped,
+      retryInMs
+    )
+  }
+
   if (!asrSessions.install(kind, generation, stream)) return
-  try {
-    stream.connect()
-  } catch (error) {
-    fallback((error as Error).message)
+  for (const chunk of seedAudio) stream.send(chunk)
+  if (attempt === 0) {
+    sendTranscriptStatus(source, 'connecting', 'Connecting to Sarvam...', 'sarvam')
   }
+  const connect = (): void => {
+    if (!asrSessions.isCurrent(kind, generation, stream)) return
+    try {
+      stream.connect()
+      connectionTimer = setTimeout(() => restart('connection timed out'), 10_000)
+    } catch (error) {
+      restart((error as Error).message)
+    }
+  }
+  if (delayMs > 0) setTimeout(connect, delayMs)
+  else connect()
 }
 
-function startAsr(kind: AsrKind, source: 'interviewer' | 'you'): void {
+function startAsr(kind: AsrKind, source: TranscriptSource): Promise<SpeechSourceStartResult> {
   const generation = asrSessions.begin(kind)
+  const acknowledgement = beginStartAcknowledgement(kind, source, generation)
   const s = getSettings()
-  // Force Deepgram when the user wants per-speaker labels (diarization). Good
-  // for English meetings where telling participants apart matters.
-  if (asrProvider === 'deepgram') {
-    if (s.deepgramApiKey) {
-      startDeepgram(kind, source, s.deepgramApiKey, generation)
-    } else {
-      sendTranscriptStatus(source, 'error', 'Deepgram key not set (needed for speaker labels)')
-    }
-    return
-  }
-  // Force Sarvam for best accuracy on Indian-accented English (no labels). Use
-  // en-IN, not auto-detect: fixing the language to English is markedly more
-  // accurate than 'unknown', which can flip to Hindi/other-language phonetics
-  // and garble English words.
-  if (asrProvider === 'sarvam') {
-    if (s.sarvamApiKey) {
-      startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, generation, false)
-    } else if (s.deepgramApiKey) {
-      startDeepgram(kind, source, s.deepgramApiKey, generation)
-    } else {
-      sendTranscriptStatus(source, 'error', 'Speech service not configured')
-    }
-    return
-  }
-  // 'auto': Sarvam primary (English en-IN for accuracy), Deepgram fallback.
-  if (s.sarvamApiKey) {
-    startSarvam(kind, source, s.sarvamApiKey, s.deepgramApiKey, generation, false)
-  } else if (s.deepgramApiKey) {
+  const plan = resolveAsrProviderPlan(asrProvider, {
+    sarvam: Boolean(s.sarvamApiKey),
+    deepgram: Boolean(s.deepgramApiKey)
+  })
+  if (plan.provider === 'deepgram') {
     startDeepgram(kind, source, s.deepgramApiKey, generation)
+  } else if (plan.provider === 'sarvam') {
+    startSarvam(
+      kind,
+      source,
+      s.sarvamApiKey,
+      s.deepgramApiKey,
+      generation,
+      plan.allowDeepgramFallback,
+      false
+    )
   } else {
-    sendTranscriptStatus(source, 'error', 'Speech service not configured')
+    const provider = asrProvider === 'auto' ? undefined : asrProvider
+    sendTranscriptStatus(source, 'error', plan.error, provider)
+    settleStart(kind, generation, {
+      source,
+      state: 'error',
+      ...(provider ? { provider } : {}),
+      message: plan.error
+    })
+  }
+  return acknowledgement
+}
+
+function stopAsr(notify = true): void {
+  for (const [kind, acknowledgement] of startAcknowledgements) {
+    clearTimeout(acknowledgement.timer)
+    startAcknowledgements.delete(kind)
+    acknowledgement.resolve({
+      source: kind === 'system' ? 'interviewer' : 'you',
+      state: 'error',
+      message: 'Speech capture stopped before the service became ready'
+    })
+  }
+  asrSessions.stopAll()
+  if (notify) {
+    sendTranscriptStatus('interviewer', 'stopped', 'System audio stopped')
+    sendTranscriptStatus('you', 'stopped', 'Microphone stopped')
   }
 }
 
-function stopAsr(): void {
-  asrSessions.stopAll()
+function transcriptSourceForKind(kind: AsrKind): TranscriptSource {
+  return kind === 'system' ? 'interviewer' : 'you'
 }
 
-async function gracefullyStopAsr(timeoutMs: number): Promise<AudioStopResult> {
-  const snapshots = (['system', 'mic'] as const)
+function sendStoppedStatus(kind: AsrKind): void {
+  sendTranscriptStatus(
+    transcriptSourceForKind(kind),
+    'stopped',
+    kind === 'system' ? 'System audio stopped' : 'Microphone stopped'
+  )
+}
+
+async function gracefullyStopAsr(
+  timeoutMs: number,
+  requestedKinds: readonly AsrKind[] = ['system', 'mic']
+): Promise<AudioStopResult> {
+  const kinds = [...new Set(requestedKinds)]
+  const kindSet = new Set(kinds)
+  for (const [kind, acknowledgement] of startAcknowledgements) {
+    if (!kindSet.has(kind)) continue
+    clearTimeout(acknowledgement.timer)
+    startAcknowledgements.delete(kind)
+    acknowledgement.resolve({
+      source: transcriptSourceForKind(kind),
+      state: 'error',
+      message: 'Speech capture stopped before the service became ready'
+    })
+  }
+  const snapshots = kinds
     .map((kind) => asrSessions.beginIntentionalClose(kind))
     .filter((snapshot): snapshot is AsrSessionSnapshot<AsrStream> => snapshot !== null)
   const startedAt = Date.now()
   if (snapshots.length === 0) {
+    for (const kind of kinds) sendStoppedStatus(kind)
     return { timedOut: false, waitedMs: 0, finalizedKinds: [] }
   }
 
@@ -450,20 +837,22 @@ async function gracefullyStopAsr(timeoutMs: number): Promise<AudioStopResult> {
 
   for (const snapshot of snapshots) snapshot.stream.flush()
   const settled = await Promise.all(waits)
+  const finalizedKinds = snapshots
+    .filter(
+      (snapshot) =>
+        countFor(snapshot) >
+        (initialCounts.get(`${snapshot.kind}:${snapshot.generation}`) ?? 0)
+    )
+    .map((snapshot) => snapshot.kind)
   for (const snapshot of snapshots) asrSessions.closeSnapshot(snapshot)
 
   const result: AudioStopResult = {
     timedOut: settled.some((entry) => entry.timedOut),
     waitedMs: Date.now() - startedAt,
-    finalizedKinds: snapshots
-      .filter(
-        (snapshot) =>
-          countFor(snapshot) >
-          (initialCounts.get(`${snapshot.kind}:${snapshot.generation}`) ?? 0)
-      )
-      .map((snapshot) => snapshot.kind)
+    finalizedKinds
   }
   for (const key of sessionKeys) finalTranscriptCounts.delete(key)
+  for (const kind of kinds) sendStoppedStatus(kind)
   return result
 }
 
@@ -602,7 +991,7 @@ function assertOverlaySender(event: Electron.IpcMainInvokeEvent): void {
   if (!isOverlaySender(event)) throw new Error('Unauthorized IPC sender')
 }
 
-function parseSettingsInput(value: unknown): Partial<AppSettings> {
+function parseSettingsInput(value: unknown): SettingsUpdate {
   if (!value || typeof value !== 'object' || Array.isArray(value)) {
     throw new Error('Invalid settings payload')
   }
@@ -629,18 +1018,55 @@ function parseSettingsInput(value: unknown): Partial<AppSettings> {
   if (insecure !== undefined && typeof insecure !== 'boolean') {
     throw new Error('Invalid allowInsecureTls setting')
   }
+  const clearFlags = [
+    'clearSarvamApiKey',
+    'clearDeepgramApiKey',
+    'clearAzureApiKey'
+  ] as const
+  const clears: Pick<SettingsUpdate, (typeof clearFlags)[number]> = {}
+  for (const key of clearFlags) {
+    const candidate = input[key]
+    if (candidate !== undefined && typeof candidate !== 'boolean') {
+      throw new Error(`Invalid ${key} setting`)
+    }
+    if (candidate === true) clears[key] = true
+  }
   return {
     ...strings,
+    ...clears,
     ...(typeof insecure === 'boolean' ? { allowInsecureTls: insecure } : {})
   }
 }
 
-async function getDisplaySources(): Promise<Electron.DesktopCapturerSource[]> {
+async function getDisplaySources(withThumbnails = false): Promise<Electron.DesktopCapturerSource[]> {
   return desktopCapturer.getSources({
     types: ['screen'],
-    thumbnailSize: { width: 0, height: 0 },
+    thumbnailSize: withThumbnails ? { width: 320, height: 180 } : { width: 0, height: 0 },
     fetchWindowIcons: false
   })
+}
+
+function isLikelyBlankThumbnail(image: Electron.NativeImage): boolean {
+  if (image.isEmpty()) return true
+  const bitmap = image.toBitmap()
+  if (bitmap.length < 4) return true
+  const pixels = Math.floor(bitmap.length / 4)
+  const step = Math.max(1, Math.floor(pixels / 2048))
+  let minimum = 255
+  let maximum = 0
+  let dark = 0
+  let sampled = 0
+  for (let pixel = 0; pixel < pixels; pixel += step) {
+    const offset = pixel * 4
+    const luminance = Math.round(
+      bitmap[offset] * 0.114 + bitmap[offset + 1] * 0.587 + bitmap[offset + 2] * 0.299
+    )
+    minimum = Math.min(minimum, luminance)
+    maximum = Math.max(maximum, luminance)
+    if (luminance < 8) dark += 1
+    sampled += 1
+  }
+  return maximum - minimum < 4 || dark / sampled > 0.985
 }
 
 function primaryDisplaySource(
@@ -677,12 +1103,18 @@ function serializeDisplaySource(
     name: source.name,
     displayId: source.display_id,
     isPrimary: source.display_id === String(screen.getPrimaryDisplay().id),
-    isSelected: source.id === selected?.id
+    isSelected: source.id === selected?.id,
+    ...(!source.thumbnail.isEmpty()
+      ? {
+          thumbnailDataUrl: source.thumbnail.toDataURL(),
+          isLikelyBlank: isLikelyBlankThumbnail(source.thumbnail)
+        }
+      : { isLikelyBlank: true })
   }
 }
 
 async function listDisplaySources(): Promise<DisplaySourceInfo[]> {
-  const sources = await getDisplaySources()
+  const sources = await getDisplaySources(true)
   const selected = resolveSelectedDisplaySource(sources)
   return sources.map((source) => serializeDisplaySource(source, selected))
 }
@@ -744,9 +1176,12 @@ function setupAudio(): void {
       asrSessions.current(kind)?.send(buffer)
     }
   })
-  ipcMain.on('audio:start', (event, mic: unknown, provider?: unknown, keyterms?: unknown) => {
-    if (!isOverlaySender(event) || typeof mic !== 'boolean') return
-    stopAsr()
+  ipcMain.handle(
+    'audio:start',
+    async (event, mic: unknown, provider?: unknown, keyterms?: unknown): Promise<SpeechStartResult> => {
+      assertOverlaySender(event)
+      if (typeof mic !== 'boolean') throw new Error('Invalid microphone selection')
+      stopAsr(false)
     asrProvider = provider === 'deepgram' || provider === 'sarvam' ? provider : 'auto'
     asrKeyterms = Array.isArray(keyterms)
       ? keyterms
@@ -765,20 +1200,17 @@ function setupAudio(): void {
       })
     }, 1000)
 
-    // Open a live-transcription stream per active source. Sarvam is primary and
-    // Deepgram is the automatic fallback (handled inside startAsr).
-    const s = getSettings()
-    if (!s.sarvamApiKey && !s.deepgramApiKey) {
-      overlayWindow?.webContents.send('transcript:status', {
-        source: 'interviewer',
-        status: 'error',
-        message: 'Speech service not configured'
-      })
-      return
+      // Open one live-transcription stream per active source and acknowledge
+      // only after each requested provider is actually ready (or reports why it
+      // is not). PCM arriving during this wait is bounded and queued by the
+      // provider stream.
+      const starts = [startAsr('system', 'interviewer')]
+      if (mic) starts.push(startAsr('mic', 'you'))
+      else sendTranscriptStatus('you', 'stopped', 'Microphone disabled')
+      const sources = await Promise.all(starts)
+      return { ready: sources.every((source) => source.state === 'connected'), sources }
     }
-    startAsr('system', 'interviewer')
-    if (mic) startAsr('mic', 'you')
-  })
+  )
   ipcMain.on('audio:setMic', (event, enabled: unknown) => {
     if (!isOverlaySender(event) || typeof enabled !== 'boolean') return
     if (enabled) {
@@ -788,7 +1220,7 @@ function setupAudio(): void {
       }
     } else {
       asrSessions.stop('mic')
-      sendTranscriptStatus('you', 'closed', 'Microphone disabled')
+      sendTranscriptStatus('you', 'stopped', 'Microphone disabled')
     }
   })
   ipcMain.on('audio:stop', (event) => {
@@ -811,6 +1243,20 @@ function setupAudio(): void {
         : 1800
     return gracefullyStopAsr(timeoutMs)
   })
+  ipcMain.handle(
+    'audio:stopSourceGracefully',
+    async (event, requestedKind?: unknown, requestedTimeout?: unknown) => {
+      if (!isOverlaySender(event)) throw new Error('Unauthorized audio stop request')
+      if (requestedKind !== 'system' && requestedKind !== 'mic') {
+        throw new Error('Invalid audio source')
+      }
+      const timeoutMs =
+        typeof requestedTimeout === 'number' && Number.isFinite(requestedTimeout)
+          ? Math.max(300, Math.min(5000, Math.round(requestedTimeout)))
+          : 1800
+      return gracefullyStopAsr(timeoutMs, [requestedKind])
+    }
+  )
 }
 
 function createTrayIcon(): Electron.NativeImage {
@@ -836,18 +1282,35 @@ function setupTray(): void {
   try {
     tray = new Tray(createTrayIcon())
     tray.setToolTip('Interview Copilot — stealth ON (invisible)')
-    const menu = Menu.buildFromTemplate([
-      { label: 'Show overlay', click: () => showOverlay() },
-      { label: 'Hide overlay', click: () => overlayWindow?.hide() },
-      { label: 'Toggle stealth', click: () => applyStealth(!stealthOn) },
-      { type: 'separator' },
-      { label: 'Quit', click: () => app.quit() }
-    ])
-    tray.setContextMenu(menu)
+    updateTrayMenu()
     tray.on('click', () => showOverlay())
   } catch (error) {
     console.warn('Tray unavailable:', error)
   }
+}
+
+function updateTrayMenu(): void {
+  if (!tray) return
+  const shortcutLabel = shortcutHealth.allRegistered
+    ? `Keyboard shortcuts: ${shortcutHealth.registered}/${shortcutHealth.total} active`
+    : `Keyboard shortcuts: ${shortcutHealth.registered}/${shortcutHealth.total} active — retry needed`
+  tray.setContextMenu(
+    Menu.buildFromTemplate([
+      { label: 'Show overlay', click: () => showOverlay() },
+      { label: 'Hide overlay', click: () => overlayWindow?.hide() },
+      {
+        label: 'Disable click-through',
+        enabled: clickThrough,
+        click: () => applyClickThrough(false)
+      },
+      { label: 'Toggle stealth', click: () => applyStealth(!stealthOn) },
+      { type: 'separator' },
+      { label: shortcutLabel, enabled: false },
+      { label: 'Retry keyboard shortcuts', click: () => registerHotkeys() },
+      { type: 'separator' },
+      { label: 'Quit', click: () => app.quit() }
+    ])
+  )
 }
 
 function validScreenshot(value: unknown): value is ScreenshotContext {
@@ -926,14 +1389,64 @@ function azureMessages(request: AiAskRequest): ChatMessage[] {
   ]
 }
 
+function publishUpdateStatus(status: UpdateStatus): void {
+  if (
+    overlayWindow &&
+    !overlayWindow.isDestroyed() &&
+    !overlayWindow.webContents.isDestroyed()
+  ) {
+    overlayWindow.webContents.send('updates:status', status)
+  }
+}
+
+app.on('second-instance', () => {
+  showOverlay()
+})
+
 app.whenReady().then(() => {
+  if (!hasSingleInstanceLock) return
   createOverlayWindow()
   registerHotkeys()
   setupTray()
+  updateCoordinator = createProductionUpdateCoordinator({
+    enabled: app.isPackaged && process.platform === 'win32',
+    currentVersion: app.getVersion(),
+    channel: 'latest',
+    onStatus: publishUpdateStatus
+  })
+  updateCoordinator.start()
 
   ipcMain.handle('app:getVersion', (event) => {
     assertOverlaySender(event)
     return app.getVersion()
+  })
+  ipcMain.handle('release:getInfo', (event) => {
+    assertOverlaySender(event)
+    return {
+      appVersion: app.getVersion(),
+      packaged: app.isPackaged,
+      build: readPackagedBuildMetadata(process.resourcesPath)
+    }
+  })
+  ipcMain.handle('updates:getStatus', (event) => {
+    assertOverlaySender(event)
+    return updateCoordinator?.currentStatus ?? null
+  })
+  ipcMain.handle('updates:check', async (event) => {
+    assertOverlaySender(event)
+    return (await updateCoordinator?.checkForUpdates()) ?? false
+  })
+  ipcMain.handle('updates:checkRollback', async (event) => {
+    assertOverlaySender(event)
+    return (await updateCoordinator?.checkForRollback()) ?? false
+  })
+  ipcMain.handle('updates:download', async (event) => {
+    assertOverlaySender(event)
+    return (await updateCoordinator?.downloadUpdate()) ?? false
+  })
+  ipcMain.handle('updates:install', (event) => {
+    assertOverlaySender(event)
+    return updateCoordinator?.installDownloadedUpdate() ?? false
   })
   ipcMain.handle('app:hasKeys', (event) => {
     assertOverlaySender(event)
@@ -942,6 +1455,19 @@ app.whenReady().then(() => {
       deepgram: s.sarvamKeySet || s.deepgramKeySet,
       azureOpenAI: s.azureKeySet && Boolean(s.azureEndpoint)
     }
+  })
+
+  ipcMain.handle('shortcuts:getHealth', (event) => {
+    assertOverlaySender(event)
+    return shortcutHealth
+  })
+  ipcMain.handle('shortcuts:retry', (event) => {
+    assertOverlaySender(event)
+    return registerHotkeys()
+  })
+  ipcMain.handle('speech:getHealth', (event) => {
+    assertOverlaySender(event)
+    return speechHealth
   })
 
   ipcMain.handle('settings:get', (event) => {
@@ -962,8 +1488,7 @@ app.whenReady().then(() => {
   })
   ipcMain.on('window:setClickThrough', (event, value: unknown) => {
     if (!isOverlaySender(event) || typeof value !== 'boolean') return
-    clickThrough = value
-    overlayWindow?.setIgnoreMouseEvents(value, { forward: true })
+    applyClickThrough(value)
   })
 
   ipcMain.handle('window:getStealth', (event) => {
@@ -1031,7 +1556,8 @@ app.whenReady().then(() => {
           if (aiAbort === controller) aiAbort = null
         }
       },
-      controller.signal
+      controller.signal,
+      { maxOutputTokens: outputTokenBudgetForIntent(request.intent) }
     )
   })
   ipcMain.on('ai:cancel', (event, requestId?: string) => {
@@ -1123,6 +1649,8 @@ app.on('window-all-closed', () => {
 })
 
 app.on('will-quit', () => {
+  updateCoordinator?.stop()
+  updateCoordinator = null
   globalShortcut.unregisterAll()
   if (audioStatsTimer) clearInterval(audioStatsTimer)
   stopAsr()

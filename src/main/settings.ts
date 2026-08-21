@@ -24,6 +24,12 @@ export interface SettingsStatus {
   allowInsecureTls: boolean
 }
 
+export type SettingsUpdate = Partial<AppSettings> & {
+  clearSarvamApiKey?: boolean
+  clearDeepgramApiKey?: boolean
+  clearAzureApiKey?: boolean
+}
+
 const DEFAULT_API_VERSION = '2024-12-01-preview'
 
 let cache: Partial<AppSettings> | null = null
@@ -84,13 +90,15 @@ function load(): Partial<AppSettings> {
 export function getSettings(): AppSettings {
   const s = load()
   return {
-    sarvamApiKey: s.sarvamApiKey || process.env.SARVAM_API_KEY || '',
-    deepgramApiKey: s.deepgramApiKey || process.env.DEEPGRAM_API_KEY || '',
-    azureEndpoint: s.azureEndpoint || process.env.AZURE_OPENAI_ENDPOINT || '',
-    azureApiKey: s.azureApiKey || process.env.AZURE_OPENAI_API_KEY || '',
-    azureDeployment: s.azureDeployment || process.env.AZURE_OPENAI_DEPLOYMENT || '',
+    // An explicitly stored empty value intentionally suppresses a development
+    // .env fallback, allowing the Settings UI to truly remove a saved secret.
+    sarvamApiKey: s.sarvamApiKey ?? process.env.SARVAM_API_KEY ?? '',
+    deepgramApiKey: s.deepgramApiKey ?? process.env.DEEPGRAM_API_KEY ?? '',
+    azureEndpoint: s.azureEndpoint ?? process.env.AZURE_OPENAI_ENDPOINT ?? '',
+    azureApiKey: s.azureApiKey ?? process.env.AZURE_OPENAI_API_KEY ?? '',
+    azureDeployment: s.azureDeployment ?? process.env.AZURE_OPENAI_DEPLOYMENT ?? '',
     azureApiVersion:
-      s.azureApiVersion || process.env.AZURE_OPENAI_API_VERSION || DEFAULT_API_VERSION,
+      s.azureApiVersion ?? process.env.AZURE_OPENAI_API_VERSION ?? DEFAULT_API_VERSION,
     allowInsecureTls: s.allowInsecureTls ?? process.env.DEEPGRAM_ALLOW_INSECURE_TLS === 'true'
   }
 }
@@ -110,18 +118,30 @@ export function getSettingsStatus(): SettingsStatus {
 }
 
 /**
- * Persist a partial update. Blank API keys are ignored so the user can edit other
- * fields without clearing a previously-saved key by submitting an empty box.
+ * Persist a partial update. Blank API-key fields remain non-destructive for the
+ * existing Settings form; explicit clear flags store an empty override so even
+ * a development .env fallback is suppressed.
  */
-export function saveSettings(partial: Partial<AppSettings>): void {
-  const next: Partial<AppSettings> = { ...load() }
+export function mergeSettings(
+  current: Partial<AppSettings>,
+  partial: SettingsUpdate
+): Partial<AppSettings> {
+  const next: Partial<AppSettings> = { ...current }
   if (partial.sarvamApiKey) next.sarvamApiKey = partial.sarvamApiKey
   if (partial.deepgramApiKey) next.deepgramApiKey = partial.deepgramApiKey
   if (partial.azureApiKey) next.azureApiKey = partial.azureApiKey
+  if (partial.clearSarvamApiKey) next.sarvamApiKey = ''
+  if (partial.clearDeepgramApiKey) next.deepgramApiKey = ''
+  if (partial.clearAzureApiKey) next.azureApiKey = ''
   if (partial.azureEndpoint !== undefined) next.azureEndpoint = partial.azureEndpoint
   if (partial.azureDeployment !== undefined) next.azureDeployment = partial.azureDeployment
   if (partial.azureApiVersion !== undefined) next.azureApiVersion = partial.azureApiVersion
   if (partial.allowInsecureTls !== undefined) next.allowInsecureTls = partial.allowInsecureTls
+  return next
+}
+
+export function saveSettings(partial: SettingsUpdate): void {
+  const next = mergeSettings(load(), partial)
   persistSettingsAtomically(settingsFile(), next)
   cache = next
 }

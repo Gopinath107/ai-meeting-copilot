@@ -1,19 +1,60 @@
-import type { DisplaySourceInfo } from '../../../../shared/capture'
+import type { AudioSourceKind, DisplaySourceInfo } from '../../../../shared/capture'
+import {
+  captureAudioLevelStore,
+  useAudioLevel,
+  type AudioLevelSnapshot,
+  type AudioLevelStore
+} from '../../audio/audioLevelStore'
 import type { CaptureDisplayState } from './TranscriptPanel'
+import { StealthSelect } from '../../components/StealthSelect'
 
 export type SpeechProvider = 'auto' | 'deepgram' | 'sarvam'
 
+export function screenToggleDisabled(
+  captureState: CaptureDisplayState,
+  screenEnabled: boolean,
+  screenAcquiring: boolean
+): boolean {
+  return (
+    captureState === 'starting' ||
+    captureState === 'finalizing' ||
+    (screenAcquiring && !screenEnabled)
+  )
+}
+
+export function screenSourceControlsDisabled(
+  captureState: CaptureDisplayState,
+  loadingDisplaySources: boolean,
+  screenAcquiring: boolean
+): boolean {
+  return (
+    captureState === 'starting' ||
+    captureState === 'finalizing' ||
+    loadingDisplaySources ||
+    screenAcquiring
+  )
+}
+
 function Meter({
+  kind,
   label,
-  level,
+  levelStore,
+  fallbackLevel,
   seconds,
   active
 }: {
+  kind: AudioSourceKind
   label: string
-  level: number
+  levelStore?: AudioLevelStore
+  fallbackLevel: number
   seconds: number
   active: boolean
 }) {
+  // The compatibility path keeps existing callers working until OverlayView
+  // moves level writes out of component state. With a stable levelStore prop,
+  // only this Meter re-renders when its source changes.
+  const storedLevel = useAudioLevel(levelStore ?? captureAudioLevelStore, kind)
+  const level = levelStore ? storedLevel : fallbackLevel
   const percent = Math.min(100, Math.round(level * 160))
   return (
     <div className="flex-1">
@@ -40,14 +81,17 @@ export function CaptureControls({
   screenEnabled,
   provider,
   audioError,
-  levels,
+  levels = { system: 0, mic: 0 },
+  levelStore,
   seconds,
   displaySources,
   selectedDisplaySourceId,
   loadingDisplaySources,
+  screenAcquiring,
   screenError,
   screenReady,
   lastScreenSentAt,
+  hasGeneratedSummary,
   generatingMinutes,
   onStartOrPause,
   onNewSession,
@@ -56,7 +100,9 @@ export function CaptureControls({
   onToggleScreen,
   onProviderChange,
   onSelectDisplaySource,
-  onRefreshDisplaySources
+  onRefreshDisplaySources,
+  collapsed,
+  onToggleCollapsed
 }: {
   captureState: CaptureDisplayState
   transcriptLineCount: number
@@ -66,14 +112,18 @@ export function CaptureControls({
   screenEnabled: boolean
   provider: SpeechProvider
   audioError: string | null
-  levels: { system: number; mic: number }
+  /** @deprecated Pass a stable levelStore to isolate high-frequency meter renders. */
+  levels?: AudioLevelSnapshot
+  levelStore?: AudioLevelStore
   seconds: { system: number; mic: number }
   displaySources: DisplaySourceInfo[]
   selectedDisplaySourceId: string
   loadingDisplaySources: boolean
+  screenAcquiring: boolean
   screenError: string | null
   screenReady: boolean
   lastScreenSentAt: number | null
+  hasGeneratedSummary: boolean
   generatingMinutes: boolean
   onStartOrPause: () => void
   onNewSession: () => void
@@ -83,14 +133,28 @@ export function CaptureControls({
   onProviderChange: (provider: SpeechProvider) => void
   onSelectDisplaySource: (id: string) => void
   onRefreshDisplaySources: () => void
+  /** Folds the provider picker, meters and screen picker away — never the buttons. */
+  collapsed: boolean
+  onToggleCollapsed: () => void
 }) {
   const capturing = captureState === 'active'
   const captureBusy = captureState !== 'idle'
+  const selectedDisplay = displaySources.find((source) => source.id === selectedDisplaySourceId)
+  const sourceControlsDisabled = screenSourceControlsDisabled(
+    captureState,
+    loadingDisplaySources,
+    screenAcquiring
+  )
 
   return (
-    <div className="no-drag mx-3 mb-2 rounded-xl border border-white/10 bg-black/20 p-2.5">
-      <div className="mb-2 flex flex-wrap items-center gap-2">
+    <div
+      className={`no-drag mx-3 shrink-0 rounded-xl border border-white/10 bg-black/20 ${
+        collapsed ? 'mb-1.5 p-1.5' : 'mb-2 p-2.5'
+      }`}
+    >
+      <div className={`flex flex-wrap items-center gap-2 ${collapsed ? '' : 'mb-2'}`}>
         <button
+          type="button"
           onClick={onStartOrPause}
           disabled={captureState === 'finalizing'}
           className={`rounded-md px-3 py-1 text-xs font-semibold text-white ${
@@ -110,26 +174,41 @@ export function CaptureControls({
                   : 'Start listening'}
         </button>
         <button
+          type="button"
           onClick={onNewSession}
-          disabled={captureBusy || !hasSessionContent}
+          disabled={captureState === 'finalizing' || !hasSessionContent}
           title="Clear the transcript, AI memory, summaries, participant names, minutes, and all session counters"
           className="rounded-md bg-white/5 px-2 py-1 text-xs text-zinc-300 hover:bg-white/10 disabled:opacity-30"
         >
           New session
         </button>
         <button
+          type="button"
           onClick={onGenerateMinutes}
           disabled={
             captureState === 'starting' || captureState === 'finalizing' || generatingMinutes
           }
-          title="End the meeting and generate the Minutes of Meeting from the full transcript"
+          title={isMeeting ? 'End the meeting and generate minutes' : 'End the interview and generate a recap'}
           className="rounded-md bg-amber-500/90 px-3 py-1 text-xs font-semibold text-white hover:bg-amber-400 disabled:opacity-40"
         >
-          {captureBusy ? 'End & Minutes' : 'Minutes of Meeting'}
+          {captureBusy
+            ? isMeeting ? 'End & Minutes' : 'End & Recap'
+            : hasGeneratedSummary
+              ? isMeeting ? 'View minutes' : 'View recap'
+              : isMeeting ? 'Create minutes' : 'Create recap'}
         </button>
         <button
+          type="button"
           onClick={onToggleMic}
-          disabled={captureBusy}
+          disabled={captureState === 'starting' || captureState === 'finalizing'}
+          aria-pressed={micEnabled}
+          title={
+            micEnabled
+              ? 'Your voice is included in the transcript.'
+              : isMeeting
+                ? 'Your voice is not recorded and will be missing from the minutes.'
+                : 'Your voice is not recorded.'
+          }
           className={`rounded-md px-2 py-1 text-xs ${
             micEnabled ? 'bg-white/15 text-zinc-100' : 'bg-white/5 text-zinc-500'
           } disabled:opacity-50`}
@@ -137,70 +216,118 @@ export function CaptureControls({
           Mic {micEnabled ? 'on' : 'off'}
         </button>
         <button
+          type="button"
           onClick={onToggleScreen}
-          disabled={captureBusy}
-          title="Opt in to screen context. Choose a display below; one JPEG is sent only when you request screen-aware AI."
+          disabled={screenToggleDisabled(captureState, screenEnabled, screenAcquiring)}
+          aria-pressed={screenEnabled}
+          title="Opt in to screen context, before or during a session. Choose a display below; one JPEG is sent only when you request screen-aware AI."
           className={`rounded-md px-2 py-1 text-xs ${
             screenEnabled ? 'bg-cyan-400/15 text-cyan-200' : 'bg-white/5 text-zinc-500'
           } disabled:opacity-50`}
         >
           Screen {screenEnabled ? 'on' : 'off'}
         </button>
-        <select
-          value={provider}
-          onChange={(event) => onProviderChange(event.target.value as SpeechProvider)}
-          disabled={captureBusy}
-          title="Auto uses Sarvam first and falls back to Deepgram. Choose Deepgram directly for diarized speaker labels."
-          className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 focus:border-indigo-400/50 focus:outline-none disabled:opacity-50"
+        {!collapsed && (
+          <StealthSelect<SpeechProvider>
+            label="Speech-to-text provider"
+            value={provider}
+            onChange={onProviderChange}
+            disabled={captureBusy}
+            title="Auto uses Sarvam first and falls back to Deepgram. Choose Deepgram directly for diarized speaker labels."
+            options={[
+              { value: 'auto', label: 'Auto (Sarvam + fallback)' },
+              { value: 'sarvam', label: 'Sarvam · Indian English' },
+              { value: 'deepgram', label: 'Deepgram · English + labels' }
+            ]}
+          />
+        )}
+        <button
+          type="button"
+          onClick={onToggleCollapsed}
+          aria-expanded={!collapsed}
+          aria-controls="capture-controls-details"
+          aria-label={collapsed ? 'Show capture details' : 'Hide capture details'}
+          title={
+            collapsed
+              ? 'Show the provider, level meters and screen picker'
+              : 'Hide the provider, level meters and screen picker to give the answer more room'
+          }
+          className="ml-auto rounded-md bg-white/5 px-1.5 py-1 text-[10px] font-medium text-zinc-400 hover:bg-white/10 hover:text-zinc-200"
         >
-          <option value="auto">Auto (Sarvam + fallback)</option>
-          <option value="sarvam">Sarvam · Indian English</option>
-          <option value="deepgram">Deepgram · English + labels</option>
-        </select>
+          {collapsed ? 'More ▸' : 'Less ▾'}
+        </button>
         {audioError && (
-          <span className="truncate text-[10px] text-red-300" title={audioError}>
+          <span role="alert" className="basis-full text-[10px] text-red-300" title={audioError}>
             {audioError}
           </span>
         )}
       </div>
 
+      {!collapsed && (
+      <div id="capture-controls-details" className="contents">
       <div className="flex items-center gap-3">
         <Meter
+          kind="system"
           label={isMeeting ? 'Meeting (system)' : 'Interviewer (system)'}
-          level={levels.system}
+          levelStore={levelStore}
+          fallbackLevel={levels.system}
           seconds={seconds.system}
           active={capturing}
         />
         {micEnabled && (
-          <Meter label="You (mic)" level={levels.mic} seconds={seconds.mic} active={capturing} />
+          <Meter
+            kind="mic"
+            label="You (mic)"
+            levelStore={levelStore}
+            fallbackLevel={levels.mic}
+            seconds={seconds.mic}
+            active={capturing}
+          />
         )}
       </div>
 
+      {isMeeting && !micEnabled && (
+        <p className="mt-1.5 text-[10px] text-amber-300/90">
+          Mic is off: your side of the conversation will not appear in the transcript or minutes.
+        </p>
+      )}
+
       {screenEnabled && (
         <div className="mt-2 flex flex-wrap items-center gap-2 text-[10px]">
-          <select
+          {selectedDisplay?.thumbnailDataUrl && captureState === 'idle' && (
+            <img
+              src={selectedDisplay.thumbnailDataUrl}
+              alt={`Preview of ${selectedDisplay.name}`}
+              className="h-12 w-20 rounded border border-white/15 bg-black object-cover"
+            />
+          )}
+          <StealthSelect
+            label="Screen source"
             value={selectedDisplaySourceId}
-            onChange={(event) => onSelectDisplaySource(event.target.value)}
-            disabled={captureBusy || loadingDisplaySources}
-            aria-label="Screen source"
-            className="max-w-64 rounded border border-white/10 bg-zinc-900 px-1.5 py-0.5 text-cyan-100 disabled:opacity-50"
-          >
-            {displaySources.length === 0 && <option value="">No screen sources</option>}
-            {displaySources.map((source) => (
-              <option key={source.id} value={source.id}>
-                {source.name}{source.isPrimary ? ' (primary)' : ''}
-              </option>
-            ))}
-          </select>
+            onChange={onSelectDisplaySource}
+            disabled={sourceControlsDisabled || displaySources.length === 0}
+            options={
+              displaySources.length === 0
+                ? [{ value: '', label: 'No screen sources' }]
+                : displaySources.map((source) => ({
+                    value: source.id,
+                    label: `${source.name}${source.isPrimary ? ' (primary)' : ''}`
+                  }))
+            }
+            className="max-w-64 py-0.5 text-[10px] text-cyan-100"
+          />
           <button
+            type="button"
             onClick={onRefreshDisplaySources}
-            disabled={captureBusy || loadingDisplaySources}
+            disabled={sourceControlsDisabled}
             className="rounded bg-white/5 px-1.5 py-0.5 text-zinc-300 hover:bg-white/10 disabled:opacity-50"
           >
             {loadingDisplaySources ? 'Refreshing…' : 'Refresh screens'}
           </button>
-          <span className={screenError ? 'text-amber-300' : 'text-cyan-300'}>
-            {screenError
+          <span role={screenError ? 'alert' : 'status'} className={screenError ? 'text-amber-300' : 'text-cyan-300'}>
+            {selectedDisplay?.isLikelyBlank && captureState === 'idle'
+              ? 'This display preview looks blank. Choose another display or check Windows capture permissions.'
+              : screenError
               ? screenError
               : screenReady
                 ? lastScreenSentAt
@@ -211,6 +338,8 @@ export function CaptureControls({
                   : 'The selected source will be used when listening starts.'}
           </span>
         </div>
+      )}
+      </div>
       )}
     </div>
   )

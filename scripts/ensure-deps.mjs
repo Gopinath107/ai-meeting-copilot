@@ -13,6 +13,7 @@ import { fileURLToPath } from 'node:url'
 const root = join(dirname(fileURLToPath(import.meta.url)), '..')
 const nm = join(root, 'node_modules')
 const manifest = JSON.parse(readFileSync(join(root, 'package.json'), 'utf8'))
+const lockfile = JSON.parse(readFileSync(join(root, 'package-lock.json'), 'utf8'))
 const requiredPackages = [
   ...Object.keys(manifest.dependencies ?? {}),
   ...Object.keys(manifest.devDependencies ?? {})
@@ -51,8 +52,18 @@ function runNpm(args, extraEnv = {}) {
   return 1
 }
 
-const dependenciesHealthy =
-  existsSync(nm) && requiredPackages.every((name) => existsSync(join(nm, name, 'package.json')))
+function installedVersionMatchesLock(name) {
+  try {
+    const expected = lockfile.packages?.[`node_modules/${name}`]?.version
+    if (typeof expected !== 'string' || !expected) return false
+    const installed = JSON.parse(readFileSync(join(nm, name, 'package.json'), 'utf8')).version
+    return installed === expected
+  } catch {
+    return false
+  }
+}
+
+const dependenciesHealthy = existsSync(nm) && requiredPackages.every(installedVersionMatchesLock)
 
 if (!dependenciesHealthy) {
   console.log('[ensure-deps] node_modules missing or incomplete — running npm ci...')

@@ -3,6 +3,7 @@ import { describe, expect, it, vi } from 'vitest'
 vi.mock('electron', () => ({ app: { getPath: () => 'unused-test-path' } }))
 
 import {
+  mergeSettings,
   persistSettingsAtomically,
   type SettingsPersistence
 } from '../src/main/settings'
@@ -41,5 +42,17 @@ describe('persistSettingsAtomically', () => {
       'replace denied'
     )
     expect(remove).toHaveBeenCalledWith(temporaryPath)
+  })
+})
+
+describe('mergeSettings', () => {
+  it('only clears keys when an explicit clear flag is supplied', () => {
+    const current = { sarvamApiKey: 'saved-sarvam', azureApiKey: 'saved-azure' }
+
+    expect(mergeSettings(current, { sarvamApiKey: '' })).toEqual(current)
+    expect(mergeSettings(current, { clearSarvamApiKey: true })).toEqual({
+      sarvamApiKey: '',
+      azureApiKey: 'saved-azure'
+    })
   })
 })

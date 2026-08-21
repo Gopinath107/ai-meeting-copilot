@@ -37,10 +37,10 @@ const components: Components = {
   strong: ({ children }) => <strong className="font-semibold text-white">{children}</strong>,
   em: ({ children }) => <em className="italic">{children}</em>,
   h1: ({ children }) => (
-    <h3 className="mb-1 mt-2 text-[13px] font-semibold text-indigo-200 first:mt-0">{children}</h3>
+    <h1 className="mb-1.5 mt-3 text-[15px] font-semibold text-indigo-100 first:mt-0">{children}</h1>
   ),
   h2: ({ children }) => (
-    <h3 className="mb-1 mt-2 text-[13px] font-semibold text-indigo-200 first:mt-0">{children}</h3>
+    <h2 className="mb-1 mt-2.5 text-[14px] font-semibold text-indigo-100 first:mt-0">{children}</h2>
   ),
   h3: ({ children }) => (
     <h3 className="mb-1 mt-2 text-[13px] font-semibold text-indigo-200 first:mt-0">{children}</h3>
@@ -71,6 +71,21 @@ const components: Components = {
     <blockquote className="mb-2 border-l-2 border-indigo-400/40 pl-2 text-zinc-300 last:mb-0">
       {children}
     </blockquote>
+  ),
+  table: ({ children }) => (
+    <div className="mb-2 max-w-full overflow-x-auto rounded border border-white/10">
+      <table className="min-w-full border-collapse text-left text-[11px]">{children}</table>
+    </div>
+  ),
+  th: ({ children }) => (
+    <th className="border-b border-r border-white/10 bg-white/5 px-2 py-1 font-semibold text-zinc-100 last:border-r-0">
+      {children}
+    </th>
+  ),
+  td: ({ children }) => (
+    <td className="border-b border-r border-white/10 px-2 py-1 align-top last:border-r-0">
+      {children}
+    </td>
   ),
   pre: ({ children }) => (
     <pre className="mb-2 overflow-x-auto rounded-lg border border-white/10 bg-black/40 p-2.5 last:mb-0">

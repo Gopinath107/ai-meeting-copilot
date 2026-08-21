@@ -12,3 +12,4 @@ coverage
 .vite
 .eslintcache
 *.tsbuildinfo
+build/generated/*.json

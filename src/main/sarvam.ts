@@ -1,4 +1,5 @@
 import WebSocket from 'ws'
+import { BoundedPcmBuffer } from './asrSession'
 
 export type TranscriptHandler = (
   text: string,
@@ -13,6 +14,8 @@ export interface AsrStream {
   send(pcm: ArrayBuffer | Buffer | Uint8Array): void
   flush(): void
   close(): void
+  takePendingAudio(): Buffer[]
+  takeDroppedAudioBytes(): number
 }
 
 export interface SarvamOptions {
@@ -46,7 +49,12 @@ export interface SarvamOptions {
  */
 export class SarvamStream implements AsrStream {
   private ws: WebSocket | null = null
+  private connectStarted = false
+  private closed = false
+  private flushRequested = false
   private flushSent = false
+  private drainTimer: ReturnType<typeof setTimeout> | null = null
+  private readonly pendingAudio = new BoundedPcmBuffer()
   private readonly url: string
   private readonly sampleRate: number
 
@@ -67,12 +75,23 @@ export class SarvamStream implements AsrStream {
   }
 
   connect(): void {
+    // Graceful Stop may bypass a delayed reconnect to finalize queued audio.
+    // Prevent the original retry timer from creating a second socket afterward.
+    if (this.closed || this.connectStarted) return
+    this.connectStarted = true
     const ws = new WebSocket(this.url, {
       headers: { 'api-subscription-key': this.opts.apiKey }
     })
     this.ws = ws
 
-    ws.on('open', () => this.opts.onOpen?.())
+    ws.on('open', () => {
+      if (this.closed || this.ws !== ws) {
+        ws.close()
+        return
+      }
+      this.drainPendingAudio(this.flushRequested)
+      this.opts.onOpen?.()
+    })
 
     ws.on('message', (data: WebSocket.RawData) => {
       try {
@@ -96,17 +115,38 @@ export class SarvamStream implements AsrStream {
     })
 
     ws.on('error', (error) => this.opts.onError?.(error))
-    ws.on('close', () => this.opts.onClose?.())
+    ws.on('close', () => {
+      if (this.drainTimer) clearTimeout(this.drainTimer)
+      this.drainTimer = null
+      this.opts.onClose?.()
+    })
   }
 
   send(pcm: ArrayBuffer | Buffer | Uint8Array): void {
     const ws = this.ws
-    if (!ws || ws.readyState !== WebSocket.OPEN) return
     const buf = Buffer.isBuffer(pcm)
       ? pcm
       : ArrayBuffer.isView(pcm)
         ? Buffer.from(pcm.buffer, pcm.byteOffset, pcm.byteLength)
         : Buffer.from(pcm)
+    if (
+      ws &&
+      ws.readyState === WebSocket.OPEN &&
+      ws.bufferedAmount < 256 * 1024 &&
+      this.pendingAudio.byteLength === 0
+    ) {
+      try {
+        this.sendBuffer(ws, buf)
+        return
+      } catch {
+        // Preserve this chunk for reconnect/fallback.
+      }
+    }
+    this.pendingAudio.push(buf)
+    this.scheduleDrain()
+  }
+
+  private sendBuffer(ws: WebSocket, buf: Buffer): void {
     ws.send(
       JSON.stringify({
         audio: {
@@ -118,22 +158,85 @@ export class SarvamStream implements AsrStream {
     )
   }
 
-  flush(): void {
+  private scheduleDrain(): void {
+    if (this.drainTimer || !this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = null
+      this.drainPendingAudio()
+    }, 40)
+  }
+
+  private drainPendingAudio(force = false): void {
     const ws = this.ws
     if (!ws || ws.readyState !== WebSocket.OPEN) return
+    while (this.pendingAudio.byteLength > 0 && (force || ws.bufferedAmount < 256 * 1024)) {
+      const chunk = this.pendingAudio.shift()
+      if (!chunk) break
+      try {
+        this.sendBuffer(ws, chunk)
+      } catch {
+        this.pendingAudio.prepend(chunk)
+        break
+      }
+    }
+    if (this.pendingAudio.byteLength > 0) this.scheduleDrain()
+    else this.sendFlushIfReady(ws)
+  }
+
+  private sendFlushIfReady(ws: WebSocket): void {
+    if (
+      !this.flushRequested ||
+      this.flushSent ||
+      this.pendingAudio.byteLength > 0 ||
+      ws.readyState !== WebSocket.OPEN
+    ) {
+      return
+    }
     try {
       ws.send(JSON.stringify({ type: 'flush' }))
       this.flushSent = true
     } catch {
-      // The socket's error/close callback owns reporting.
+      // Retry briefly while the graceful-stop deadline is still running.
+      this.scheduleDrain()
     }
   }
 
+  takePendingAudio(): Buffer[] {
+    return this.pendingAudio.drain()
+  }
+
+  takeDroppedAudioBytes(): number {
+    return this.pendingAudio.takeDroppedBytes()
+  }
+
+  flush(): void {
+    this.flushRequested = true
+    const ws = this.ws
+    if (!ws) {
+      // A reconnecting stream may still hold the last few seconds of bounded
+      // PCM. Connect immediately rather than letting the retry delay outlive
+      // the graceful-stop window and discard that tail.
+      try {
+        this.connect()
+      } catch (error) {
+        this.opts.onError?.(error instanceof Error ? error : new Error(String(error)))
+      }
+      return
+    }
+    if (ws.readyState !== WebSocket.OPEN) return
+    this.drainPendingAudio(true)
+  }
+
   close(): void {
+    this.closed = true
     const ws = this.ws
     // Preserve the best-effort behavior of a normal, immediate stop. A graceful
     // stop calls flush(), waits for final transcripts, and only then calls close().
     if (!this.flushSent && ws && ws.readyState === WebSocket.OPEN) this.flush()
+    if (this.drainTimer) {
+      clearTimeout(this.drainTimer)
+      this.drainTimer = null
+    }
     this.ws = null
     ws?.close()
   }

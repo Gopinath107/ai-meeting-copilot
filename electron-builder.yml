@@ -2,6 +2,8 @@ appId: com.interviewcopilot.app
 productName: Interview Copilot
 directories:
   buildResources: build
+  output: dist
+generateUpdatesFilesForAllChannels: true
 files:
   - out/**
   - package.json
@@ -16,17 +18,24 @@ files:
 asarUnpack:
   - node_modules/pdf-parse/**
   - node_modules/pdfjs-dist/**
+extraResources:
+  - from: build/generated/build-metadata.json
+    to: build-metadata.json
 win:
   executableName: interview-copilot
   target:
     - nsis
 nsis:
-  artifactName: ${name}-${version}-setup.${ext}
+  artifactName: ${name}-${version}-windows-${arch}-setup.${ext}
   shortcutName: ${productName}
   uninstallDisplayName: ${productName}
   createDesktopShortcut: always
   oneClick: false
   perMachine: false
   allowToChangeInstallationDirectory: true
-# No publish provider — local build only.
-publish: null
+publish:
+  - provider: github
+    owner: Gopinath107
+    repo: ai-meeting-copilot
+    channel: latest
+    releaseType: release
