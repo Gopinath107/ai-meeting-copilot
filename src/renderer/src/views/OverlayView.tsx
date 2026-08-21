@@ -67,6 +67,7 @@ import {
 } from './overlay/aiOrchestration'
 import { isLikelyTranscriptNoise } from './overlay/transcriptSafety'
 import { hasAiConfiguration, hasSpeechConfiguration } from './overlay/uiState'
+import { runScreenAcquisitionAttempt } from './overlay/screenAcquisition'
 import {
   isFocusMode,
   readOverlayPanelState,
@@ -240,6 +241,7 @@ export default function OverlayView({
   const [loadingDisplaySources, setLoadingDisplaySources] = useState(false)
   const screenEnabledRef = useRef(screenEnabled)
   const screenReadyRef = useRef(screenReady)
+  const [screenAcquiring, setScreenAcquiring] = useState(false)
   // Serializes live screen acquisition so a double-click cannot leave two display
   // streams attached (or tear down the one that just succeeded).
   const screenBusyRef = useRef(false)
@@ -1767,25 +1769,25 @@ export default function OverlayView({
     if (!capture || captureStateRef.current !== 'active' || !screenEnabledRef.current) return
     if (screenBusyRef.current) return
     screenBusyRef.current = true
+    setScreenAcquiring(true)
     try {
-      if (!(await prepareDisplaySource())) {
-        setScreenReady(false)
-        screenReadyRef.current = false
-        return
-      }
-      const ready = await capture.startScreen()
-      // The session may have been stopped, or screen switched back off, while the
-      // picker was open. Don't leave an orphaned display stream running.
-      if (
-        captureRef.current !== capture ||
-        captureStateRef.current !== 'active' ||
-        !screenEnabledRef.current
-      ) {
-        capture.stopScreen()
-        return
-      }
-      setScreenReady(ready)
-      screenReadyRef.current = ready
+      const outcome = await runScreenAcquisitionAttempt({
+        capture,
+        prepare: prepareDisplaySource,
+        isCurrent: () =>
+          captureRef.current === capture &&
+          captureStateRef.current === 'active' &&
+          screenEnabledRef.current,
+        onPending: () => {
+          setScreenReady(false)
+          screenReadyRef.current = false
+          setLastScreenSentAt(null)
+          setScreenPreview(null)
+        }
+      })
+      if (outcome !== 'ready') return
+      setScreenReady(true)
+      screenReadyRef.current = true
       setLastScreenSentAt(null)
       setScreenError(null)
     } catch (error) {
@@ -1799,11 +1801,15 @@ export default function OverlayView({
       )
     } finally {
       screenBusyRef.current = false
+      setScreenAcquiring(false)
     }
   }
 
   async function toggleScreenContext(): Promise<void> {
-    if (screenBusyRef.current) return
+    // While a pending screen is being cancelled, keep it off until that request
+    // has observed the cancellation. The active/on state remains clickable so a
+    // user can always revoke screen context while the picker is open.
+    if (screenBusyRef.current && !screenEnabledRef.current) return
     const next = !screenEnabledRef.current
     screenEnabledRef.current = next
     setScreenEnabled(next)
@@ -1827,6 +1833,7 @@ export default function OverlayView({
   }
 
   async function changeDisplaySource(id: string): Promise<void> {
+    if (screenBusyRef.current) return
     selectedDisplaySourceIdRef.current = id
     setSelectedDisplaySourceId(id)
     setScreenError(null)
@@ -1885,6 +1892,15 @@ export default function OverlayView({
         } else if (kind === 'mic' && /ended$/i.test(err.message)) {
           void stopMicCaptureGracefully(capture)
         }
+      },
+      onScreenEnded: (err) => {
+        if (captureRef.current !== capture) return
+        setScreenReady(false)
+        screenReadyRef.current = false
+        setLastScreenSentAt(null)
+        setScreenPreview(null)
+        setScreenLikelyBlank(false)
+        setScreenError(err.message)
       }
     })
     captureRef.current = capture
@@ -2496,6 +2512,7 @@ export default function OverlayView({
         displaySources={displaySources}
         selectedDisplaySourceId={selectedDisplaySourceId}
         loadingDisplaySources={loadingDisplaySources}
+        screenAcquiring={screenAcquiring}
         screenError={screenError}
         screenReady={screenReady}
         lastScreenSentAt={lastScreenSentAt}
@@ -2511,7 +2528,9 @@ export default function OverlayView({
         onToggleScreen={() => void toggleScreenContext()}
         onProviderChange={setProvider}
         onSelectDisplaySource={(id) => void changeDisplaySource(id)}
-        onRefreshDisplaySources={() => void refreshDisplaySources()}
+        onRefreshDisplaySources={() => {
+          if (!screenBusyRef.current) void refreshDisplaySources()
+        }}
         collapsed={panels.controls}
         onToggleCollapsed={() => collapsePanel('controls')}
       />

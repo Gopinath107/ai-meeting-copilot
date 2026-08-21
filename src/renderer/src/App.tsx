@@ -1,6 +1,7 @@
 import { useEffect, useState } from 'react'
 import SetupView from './views/SetupView'
 import OverlayView from './views/OverlayView'
+import { StealthTooltips } from './components/StealthTooltips'
 
 export type SessionMode = 'interview' | 'meeting' | 'consultant'
 
@@ -68,6 +69,10 @@ export default function App() {
           <OverlayView config={config} onBack={() => setView('setup')} />
         )}
       </div>
+      {/* Outside the backdrop-blur container above: a backdrop-filter makes that
+          element the containing block for position:fixed, which would trap and clip
+          the hint layer. */}
+      <StealthTooltips />
     </div>
   )
 }

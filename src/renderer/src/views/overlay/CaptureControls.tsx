@@ -6,8 +6,34 @@ import {
   type AudioLevelStore
 } from '../../audio/audioLevelStore'
 import type { CaptureDisplayState } from './TranscriptPanel'
+import { StealthSelect } from '../../components/StealthSelect'
 
 export type SpeechProvider = 'auto' | 'deepgram' | 'sarvam'
+
+export function screenToggleDisabled(
+  captureState: CaptureDisplayState,
+  screenEnabled: boolean,
+  screenAcquiring: boolean
+): boolean {
+  return (
+    captureState === 'starting' ||
+    captureState === 'finalizing' ||
+    (screenAcquiring && !screenEnabled)
+  )
+}
+
+export function screenSourceControlsDisabled(
+  captureState: CaptureDisplayState,
+  loadingDisplaySources: boolean,
+  screenAcquiring: boolean
+): boolean {
+  return (
+    captureState === 'starting' ||
+    captureState === 'finalizing' ||
+    loadingDisplaySources ||
+    screenAcquiring
+  )
+}
 
 function Meter({
   kind,
@@ -61,6 +87,7 @@ export function CaptureControls({
   displaySources,
   selectedDisplaySourceId,
   loadingDisplaySources,
+  screenAcquiring,
   screenError,
   screenReady,
   lastScreenSentAt,
@@ -92,6 +119,7 @@ export function CaptureControls({
   displaySources: DisplaySourceInfo[]
   selectedDisplaySourceId: string
   loadingDisplaySources: boolean
+  screenAcquiring: boolean
   screenError: string | null
   screenReady: boolean
   lastScreenSentAt: number | null
@@ -112,6 +140,11 @@ export function CaptureControls({
   const capturing = captureState === 'active'
   const captureBusy = captureState !== 'idle'
   const selectedDisplay = displaySources.find((source) => source.id === selectedDisplaySourceId)
+  const sourceControlsDisabled = screenSourceControlsDisabled(
+    captureState,
+    loadingDisplaySources,
+    screenAcquiring
+  )
 
   return (
     <div
@@ -185,7 +218,7 @@ export function CaptureControls({
         <button
           type="button"
           onClick={onToggleScreen}
-          disabled={captureState === 'starting' || captureState === 'finalizing'}
+          disabled={screenToggleDisabled(captureState, screenEnabled, screenAcquiring)}
           aria-pressed={screenEnabled}
           title="Opt in to screen context, before or during a session. Choose a display below; one JPEG is sent only when you request screen-aware AI."
           className={`rounded-md px-2 py-1 text-xs ${
@@ -195,18 +228,18 @@ export function CaptureControls({
           Screen {screenEnabled ? 'on' : 'off'}
         </button>
         {!collapsed && (
-          <select
-            aria-label="Speech-to-text provider"
+          <StealthSelect<SpeechProvider>
+            label="Speech-to-text provider"
             value={provider}
-            onChange={(event) => onProviderChange(event.target.value as SpeechProvider)}
+            onChange={onProviderChange}
             disabled={captureBusy}
             title="Auto uses Sarvam first and falls back to Deepgram. Choose Deepgram directly for diarized speaker labels."
-            className="rounded-md border border-white/10 bg-white/5 px-2 py-1 text-xs text-zinc-100 focus:border-indigo-400/50 focus:outline-none disabled:opacity-50"
-          >
-            <option value="auto">Auto (Sarvam + fallback)</option>
-            <option value="sarvam">Sarvam · Indian English</option>
-            <option value="deepgram">Deepgram · English + labels</option>
-          </select>
+            options={[
+              { value: 'auto', label: 'Auto (Sarvam + fallback)' },
+              { value: 'sarvam', label: 'Sarvam · Indian English' },
+              { value: 'deepgram', label: 'Deepgram · English + labels' }
+            ]}
+          />
         )}
         <button
           type="button"
@@ -268,28 +301,25 @@ export function CaptureControls({
               className="h-12 w-20 rounded border border-white/15 bg-black object-cover"
             />
           )}
-          <select
+          <StealthSelect
+            label="Screen source"
             value={selectedDisplaySourceId}
-            onChange={(event) => onSelectDisplaySource(event.target.value)}
-            disabled={
-              captureState === 'starting' || captureState === 'finalizing' || loadingDisplaySources
+            onChange={onSelectDisplaySource}
+            disabled={sourceControlsDisabled || displaySources.length === 0}
+            options={
+              displaySources.length === 0
+                ? [{ value: '', label: 'No screen sources' }]
+                : displaySources.map((source) => ({
+                    value: source.id,
+                    label: `${source.name}${source.isPrimary ? ' (primary)' : ''}`
+                  }))
             }
-            aria-label="Screen source"
-            className="max-w-64 rounded border border-white/10 bg-zinc-900 px-1.5 py-0.5 text-cyan-100 disabled:opacity-50"
-          >
-            {displaySources.length === 0 && <option value="">No screen sources</option>}
-            {displaySources.map((source) => (
-              <option key={source.id} value={source.id}>
-                {source.name}{source.isPrimary ? ' (primary)' : ''}
-              </option>
-            ))}
-          </select>
+            className="max-w-64 py-0.5 text-[10px] text-cyan-100"
+          />
           <button
             type="button"
             onClick={onRefreshDisplaySources}
-            disabled={
-              captureState === 'starting' || captureState === 'finalizing' || loadingDisplaySources
-            }
+            disabled={sourceControlsDisabled}
             className="rounded bg-white/5 px-1.5 py-0.5 text-zinc-300 hover:bg-white/10 disabled:opacity-50"
           >
             {loadingDisplaySources ? 'Refreshing…' : 'Refresh screens'}

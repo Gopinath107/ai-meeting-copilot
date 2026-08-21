@@ -7,6 +7,7 @@ export type AudioCaptureHandlers = {
   onLevel: (kind: AudioSourceKind, level: number) => void
   onChunk: (kind: AudioSourceKind, pcm: Int16Array) => void
   onError: (kind: AudioSourceKind, error: Error) => void
+  onScreenEnded?: (error: Error) => void
 }
 
 // Capture at 16 kHz mono. This is the rate Sarvam's streaming STT (our primary
@@ -35,6 +36,7 @@ export class AudioCapture {
   private readonly streams = new Map<AudioSourceKind, MediaStream>()
   private readonly nodes = new Map<AudioSourceKind, AudioWorkletNode>()
   private readonly generations: Record<AudioSourceKind, number> = { system: 0, mic: 0 }
+  private screenGeneration = 0
   private readonly flushWaiters = new Map<
     string,
     { kind: AudioSourceKind; resolve: () => void; reject: (error: Error) => void; timer: number }
@@ -59,6 +61,8 @@ export class AudioCapture {
   /** System audio loopback (the interviewer). Requires the main-process display-media handler. */
   async startSystem(captureScreen = false): Promise<boolean> {
     const generation = ++this.generations.system
+    const screenGeneration = ++this.screenGeneration
+    this.stopScreenCapture()
     const stream = await navigator.mediaDevices.getDisplayMedia({ audio: true, video: true })
     this.ensureActive('system', generation, stream)
     const audioTracks = stream.getAudioTracks()
@@ -69,27 +73,29 @@ export class AudioCapture {
 
     let screenReady = false
     const videoTrack = stream.getVideoTracks()[0]
-    if (captureScreen && videoTrack) {
+    if (captureScreen && videoTrack && screenGeneration === this.screenGeneration) {
       try {
-        await this.attachScreenTrack(videoTrack, generation)
+        await this.attachScreenTrack(videoTrack, generation, screenGeneration)
         this.ensureActive('system', generation, stream)
         screenReady = true
       } catch (error) {
         this.stopScreenCapture()
-        if ((error as Error).name === 'AbortError') {
+        if (generation !== this.generations.system) {
           audioTracks.forEach((track) => track.stop())
           throw error
         }
-        this.handlers.onError(
-          'system',
-          new Error(
-            `Screen context unavailable: ${(error as Error).message}. System audio will continue.`
+        if ((error as Error).name !== 'AbortError') {
+          this.handlers.onError(
+            'system',
+            new Error(
+              `Screen context unavailable: ${(error as Error).message}. System audio will continue.`
+            )
           )
-        )
+        }
       }
     } else {
       stream.getVideoTracks().forEach((track) => track.stop())
-      if (captureScreen) {
+      if (captureScreen && screenGeneration === this.screenGeneration) {
         this.handlers.onError(
           'system',
           new Error('Selected display did not provide a video track. System audio will continue.')
@@ -108,8 +114,13 @@ export class AudioCapture {
   }
 
   /** Mount a display video track on the hidden element used for frame grabs. */
-  private async attachScreenTrack(videoTrack: MediaStreamTrack, generation: number): Promise<void> {
+  private async attachScreenTrack(
+    videoTrack: MediaStreamTrack,
+    generation: number,
+    screenGeneration: number
+  ): Promise<void> {
     const videoStream = new MediaStream([videoTrack])
+    this.ensureScreenActive(screenGeneration, videoStream)
     const video = document.createElement('video')
     video.muted = true
     video.playsInline = true
@@ -124,13 +135,14 @@ export class AudioCapture {
       'ended',
       () => {
         if (this.screenVideo === video) {
-          this.handlers.onError('system', new Error('Screen sharing ended'))
+          this.stopScreenCapture()
+          this.handlers.onScreenEnded?.(new Error('Screen sharing ended'))
         }
       },
       { once: true }
     )
     await video.play()
-    await this.waitForVideoFrame(video, generation)
+    await this.waitForVideoFrame(video, generation, screenGeneration)
   }
 
   /**
@@ -147,8 +159,11 @@ export class AudioCapture {
     // Reuse the CURRENT system generation: if the audio session is replaced while
     // we are acquiring, this attach aborts instead of leaking a stale video track.
     const generation = this.generations.system
+    const screenGeneration = ++this.screenGeneration
     this.stopScreenCapture()
     const stream = await navigator.mediaDevices.getDisplayMedia({ audio: false, video: true })
+    this.ensureActive('system', generation, stream)
+    this.ensureScreenActive(screenGeneration, stream)
     const videoTrack = stream.getVideoTracks()[0]
     if (!videoTrack) {
       stream.getTracks().forEach((track) => track.stop())
@@ -158,9 +173,9 @@ export class AudioCapture {
     // nothing competes with the loopback capture already feeding the ASR.
     stream.getAudioTracks().forEach((track) => track.stop())
     try {
+      await this.attachScreenTrack(videoTrack, generation, screenGeneration)
       this.ensureActive('system', generation, stream)
-      await this.attachScreenTrack(videoTrack, generation)
-      this.ensureActive('system', generation, stream)
+      this.ensureScreenActive(screenGeneration, stream)
       return true
     } catch (error) {
       this.stopScreenCapture()
@@ -170,6 +185,7 @@ export class AudioCapture {
 
   /** Drop screen context, leaving audio capture and speech-to-text running. */
   stopScreen(): void {
+    this.screenGeneration += 1
     this.stopScreenCapture()
   }
 
@@ -183,7 +199,17 @@ export class AudioCapture {
     throw new DOMException('Capture stopped', 'AbortError')
   }
 
-  private async waitForVideoFrame(video: HTMLVideoElement, generation: number): Promise<void> {
+  private ensureScreenActive(generation: number, stream?: MediaStream): void {
+    if (generation === this.screenGeneration) return
+    stream?.getTracks().forEach((track) => track.stop())
+    throw new DOMException('Screen capture stopped', 'AbortError')
+  }
+
+  private async waitForVideoFrame(
+    video: HTMLVideoElement,
+    generation: number,
+    screenGeneration: number
+  ): Promise<void> {
     await new Promise<void>((resolve, reject) => {
       let done = false
       let frameCallbackId: number | null = null
@@ -201,6 +227,7 @@ export class AudioCapture {
       const verifyFrame = (): void => {
         try {
           this.ensureActive('system', generation)
+          this.ensureScreenActive(screenGeneration)
           if (video.videoWidth > 0 && video.videoHeight > 0) finish()
           else if (video.requestVideoFrameCallback) {
             frameCallbackId = video.requestVideoFrameCallback(verifyFrame)
@@ -212,6 +239,7 @@ export class AudioCapture {
       const activeCheck = window.setInterval(() => {
         try {
           this.ensureActive('system', generation)
+          this.ensureScreenActive(screenGeneration)
           if (!video.requestVideoFrameCallback &&
               video.readyState >= HTMLMediaElement.HAVE_CURRENT_DATA &&
               video.videoWidth > 0 && video.videoHeight > 0) finish()
@@ -408,7 +436,7 @@ export class AudioCapture {
   stop(kind?: AudioSourceKind): void {
     const kinds: AudioSourceKind[] = kind ? [kind] : ['system', 'mic']
     for (const k of kinds) this.generations[k] += 1
-    if (!kind || kind === 'system') this.stopScreenCapture()
+    if (!kind || kind === 'system') this.stopScreen()
     for (const k of kinds) {
       for (const [requestId, waiter] of this.flushWaiters) {
         if (waiter.kind !== k) continue

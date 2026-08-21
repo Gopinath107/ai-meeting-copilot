@@ -1,5 +1,6 @@
 import { useEffect, useMemo, useRef, useState } from 'react'
 import { Markdown } from '../../components/Markdown'
+import { StealthSelect } from '../../components/StealthSelect'
 import {
   INTERVIEW_ANSWER_STYLES,
   createInterviewAnswerRequest,
@@ -268,23 +269,19 @@ function InterviewControlsBar({
 }) {
   return (
     <div className="flex shrink-0 items-center justify-between gap-2 border-b border-white/10 bg-black/10 px-3 py-1">
-      <label className="flex items-center gap-1.5 text-[10px] text-zinc-400">
+      <div className="flex items-center gap-1.5 text-[10px] text-zinc-400">
         <span>Answer style</span>
-        <select
-          aria-label="Interview answer style"
+        <StealthSelect
+          label="Interview answer style"
           value={controls.answerStyle}
-          onChange={(event) =>
-            controls.onAnswerStyleChange(event.target.value as InterviewAnswerStyle)
-          }
-          className="rounded border border-white/10 bg-zinc-900 px-1.5 py-0.5 text-[10px] capitalize text-zinc-100 focus:border-indigo-400/50 focus:outline-none"
-        >
-          {INTERVIEW_ANSWER_STYLES.map((style) => (
-            <option key={style} value={style}>
-              {style[0].toUpperCase() + style.slice(1)}
-            </option>
-          ))}
-        </select>
-      </label>
+          onChange={controls.onAnswerStyleChange}
+          options={INTERVIEW_ANSWER_STYLES.map((style) => ({
+            value: style,
+            label: style[0].toUpperCase() + style.slice(1)
+          }))}
+          className="py-0.5 text-[10px]"
+        />
+      </div>
       <button
         type="button"
         aria-expanded={pinnedOpen}
