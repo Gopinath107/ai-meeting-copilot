@@ -10,7 +10,8 @@ floating overlay that is **hidden from screen sharing / recording**.
 - **Live transcription** through Sarvam AI or Deepgram. Deepgram adds multi-speaker
   diarization ("Interviewer 1/2/3").
 - **Screen-aware answers** that combine the transcript with an on-demand current-screen snapshot.
-- **Streaming AI answers** grounded in your résumé + job description.
+- **Progressive AI answers** grounded in your résumé + job description: a three-point
+  speaking outline appears first, followed by the complete streamed answer.
 - **Manual question box** for scenario / long questions.
 - 100% Node.js / TypeScript — no Python required.
 
@@ -22,7 +23,7 @@ floating overlay that is **hidden from screen sharing / recording**.
 ## 1. Prerequisites
 
 - **Windows 10/11 (x64)**
-- **Node.js 20.19+** (Node 22 LTS recommended; setup feature-detects `--use-system-ca`)
+- **Node.js 22.13+** (or Node 24+; setup feature-detects `--use-system-ca`)
 - **npm** (ships with Node)
 - API keys:
   - At least one speech provider:
@@ -132,7 +133,9 @@ a bounded timeout so a malformed document cannot silently stall normal setup.
    display track locally and sends one compressed frame only when an answer or user-triggered
    analysis request runs; it does not continuously upload screen video.
 4. AI answers stream automatically when an interviewer asks a question, or trigger them
-   manually with the hotkey / **Answer** button, or type a question in the manual box.
+   manually with the hotkey / **Answer** button, or type a question in the manual box. In
+   interview mode you can choose concise, standard, or detailed depth, regenerate the exact
+   captured question, and pin completed answers for quick reference.
 5. Click **See screen** to request an immediate screen-focused answer or meeting analysis.
 
 ### Hotkeys
@@ -162,7 +165,7 @@ Set-ExecutionPolicy -Scope Process -ExecutionPolicy Bypass -Force; $env:NODE_OPT
 
 Output lands in `dist/`:
 
-- `ai-meeting-copilot-0.1.0-setup.exe` — the NSIS installer
+- `ai-meeting-copilot-0.1.0-windows-x64-setup.exe` — the NSIS installer
 - `win-unpacked/interview-copilot.exe` — the unpacked, runnable app
 
 Other build commands:
@@ -176,9 +179,10 @@ Other build commands:
 | `npm test` | Run the automated regression suite |
 | `npm run check` | Run lint, type-checking, and tests |
 
-> The installer is **not code-signed**, so Windows SmartScreen shows an "unknown publisher"
-> warning on first run — expected. To brand it, drop an `icon.ico` (256×256) into `build/`
-> and rebuild; otherwise the default Electron icon is used.
+Local `npm run build:win` output is intentionally unsigned and is for development/testing only.
+Production releases must use the signed tag workflow described in [docs/RELEASE.md](docs/RELEASE.md);
+that workflow refuses to publish without the signing certificate, verifies Authenticode,
+publishes SHA-256 checksums and update metadata, and preserves a controlled rollback path.
 
 ---
 

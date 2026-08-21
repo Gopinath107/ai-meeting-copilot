@@ -1,6 +1,10 @@
-import { useState } from 'react'
+import { useCallback, useEffect, useState } from 'react'
 import type { SessionConfig, SessionMode } from '../App'
 import SettingsPanel from './SettingsPanel'
+import { hasAiConfiguration, hasSpeechConfiguration } from './overlay/uiState'
+
+type SettingsStatus = Awaited<ReturnType<typeof window.api.getSettings>>
+type ShortcutHealth = Awaited<ReturnType<typeof window.api.getShortcutHealth>>
 
 function FileRow({
   label,
@@ -35,7 +39,6 @@ function FileRow({
 export default function SetupView({ onStart }: { onStart: (config: SessionConfig) => void }) {
   const [mode, setMode] = useState<SessionMode>('interview')
   const [role, setRole] = useState('')
-  const [meetingUrl, setMeetingUrl] = useState('')
   const [resumeName, setResumeName] = useState<string>()
   const [resumeText, setResumeText] = useState('')
   const [jobDescription, setJobDescription] = useState('')
@@ -47,10 +50,46 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
     message: string
   } | null>(null)
   const [showSettings, setShowSettings] = useState(false)
+  const [settingsStatus, setSettingsStatus] = useState<SettingsStatus | null>(null)
+  const [shortcutHealth, setShortcutHealth] = useState<ShortcutHealth | null>(null)
+  const [preflightError, setPreflightError] = useState('')
+  const [checkingPreflight, setCheckingPreflight] = useState(true)
   // Meeting-mode context
   const [userName, setUserName] = useState('')
   const [projectContext, setProjectContext] = useState('')
   const [techStack, setTechStack] = useState('')
+
+  const refreshPreflight = useCallback(async (): Promise<void> => {
+    setCheckingPreflight(true)
+    setPreflightError('')
+    try {
+      const [settings, shortcuts] = await Promise.all([
+        window.api.getSettings(),
+        window.api.getShortcutHealth()
+      ])
+      setSettingsStatus(settings)
+      setShortcutHealth(shortcuts)
+    } catch (error) {
+      setSettingsStatus(null)
+      setPreflightError(
+        error instanceof Error ? error.message : 'The saved configuration could not be checked.'
+      )
+    } finally {
+      setCheckingPreflight(false)
+    }
+  }, [])
+
+  useEffect(() => {
+    const timer = window.setTimeout(() => void refreshPreflight(), 0)
+    const off = window.api.onShortcutHealthChanged(setShortcutHealth)
+    return () => {
+      window.clearTimeout(timer)
+      off()
+    }
+  }, [refreshPreflight])
+
+  const speechConfigured = hasSpeechConfiguration(settingsStatus)
+  const aiConfigured = hasAiConfiguration(settingsStatus)
 
   async function pick(kind: 'resume' | 'extra'): Promise<void> {
     setBusy(kind)
@@ -119,10 +158,17 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
       {/* Body */}
       <div className="no-drag flex-1 space-y-4 overflow-y-auto px-4 pb-4">
         {/* Mode selector */}
-        <div className="grid grid-cols-3 gap-2 rounded-lg border border-white/10 bg-white/5 p-1">
+        <div
+          role="tablist"
+          aria-label="Session type"
+          className="grid grid-cols-3 gap-2 rounded-lg border border-white/10 bg-white/5 p-1"
+        >
           {(['interview', 'meeting', 'consultant'] as const).map((m) => (
             <button
               key={m}
+              type="button"
+              role="tab"
+              aria-selected={mode === m}
               onClick={() => setMode(m)}
               className={`rounded-md px-3 py-1.5 text-xs font-semibold transition ${
                 mode === m
@@ -143,10 +189,11 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
         </p>
 
         <div>
-          <label className="mb-1 block text-xs font-medium text-zinc-400">
+          <label htmlFor="session-role" className="mb-1 block text-xs font-medium text-zinc-400">
             {mode !== 'interview' ? 'Your role' : 'Role / position'}
           </label>
           <input
+            id="session-role"
             value={role}
             onChange={(e) => setRole(e.target.value)}
             placeholder={
@@ -163,19 +210,28 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
         {mode !== 'interview' && (
           <>
             <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-400">Your name</label>
+              <label htmlFor="user-name" className="mb-1 block text-xs font-medium text-zinc-400">
+                Your name <span className="font-normal text-amber-300">· recommended for auto-answer</span>
+              </label>
               <input
+                id="user-name"
                 value={userName}
                 onChange={(e) => setUserName(e.target.value)}
                 placeholder="Used to detect when a question is aimed at you"
                 className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
               />
+              {!userName.trim() && (
+                <p className="mt-1 text-[10px] text-amber-300/90">
+                  Without your name, questions addressed to you by name may not trigger auto-answer.
+                </p>
+              )}
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-400">
+              <label htmlFor="project-context" className="mb-1 block text-xs font-medium text-zinc-400">
                 Project / application
               </label>
               <textarea
+                id="project-context"
                 value={projectContext}
                 onChange={(e) => setProjectContext(e.target.value)}
                 placeholder="What is the app, and what feature(s) are you discussing? e.g. B2B invoicing app — reviewing the login / auth flow…"
@@ -184,8 +240,9 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
               />
             </div>
             <div>
-              <label className="mb-1 block text-xs font-medium text-zinc-400">Tech stack</label>
+              <label htmlFor="tech-stack" className="mb-1 block text-xs font-medium text-zinc-400">Tech stack</label>
               <input
+                id="tech-stack"
                 value={techStack}
                 onChange={(e) => setTechStack(e.target.value)}
                 placeholder={mode === 'consultant' ? 'Java 21, Spring Boot, GraphQL, Insomnia' : 'e.g. React, Node.js, PostgreSQL, AWS'}
@@ -195,24 +252,11 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
           </>
         )}
 
-        <div>
-          <label className="mb-1 block text-xs font-medium text-zinc-400">Meeting link (yours)</label>
-          <input
-            value={meetingUrl}
-            onChange={(e) => setMeetingUrl(e.target.value)}
-            placeholder="Paste your Zoom / Meet / Teams link"
-            className="w-full rounded-lg border border-white/10 bg-white/5 px-3 py-2 text-sm text-zinc-100 placeholder:text-zinc-500 focus:border-indigo-400/50 focus:outline-none"
-          />
-          <p className="mt-1 text-[11px] text-zinc-500">
-            You join normally. The app captures system audio; optional Screen mode adds one current
-            frame to AI requests instead of continuously uploading video.
-          </p>
-        </div>
-
         {mode === 'interview' && (
           <div>
-            <label className="mb-1 block text-xs font-medium text-zinc-400">Job description</label>
+            <label htmlFor="job-description" className="mb-1 block text-xs font-medium text-zinc-400">Job description</label>
             <textarea
+              id="job-description"
               value={jobDescription}
               onChange={(e) => setJobDescription(e.target.value)}
               placeholder="Paste the job description here…"
@@ -263,16 +307,86 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
             </p>
           )}
         </div>
+
+        <section
+          aria-labelledby="preflight-title"
+          className="rounded-xl border border-white/10 bg-black/20 p-3"
+        >
+          <div className="mb-2 flex items-center justify-between gap-2">
+            <h2 id="preflight-title" className="text-xs font-semibold text-zinc-200">
+              Ready to start
+            </h2>
+            <button
+              type="button"
+              onClick={() => setShowSettings(true)}
+              className="rounded bg-white/10 px-2 py-1 text-[11px] text-zinc-200 hover:bg-white/15"
+            >
+              Configure services
+            </button>
+          </div>
+          <div className="grid grid-cols-2 gap-1.5 text-[11px]">
+            <div className={speechConfigured ? 'text-emerald-300' : 'text-red-300'}>
+              Speech · {checkingPreflight ? 'Checking…' : speechConfigured ? 'Configured' : 'API key required'}
+            </div>
+            <div className={aiConfigured ? 'text-emerald-300' : 'text-amber-300'}>
+              AI answers · {checkingPreflight ? 'Checking…' : aiConfigured ? 'Configured' : 'Not configured'}
+            </div>
+            <div className="text-zinc-400">System audio · tested when listening starts</div>
+            <div className="text-zinc-400">Screen & mic · optional, tested in session</div>
+            <div className={shortcutHealth?.allRegistered ? 'text-emerald-300' : 'text-amber-300'}>
+              Shortcuts · {shortcutHealth ? `${shortcutHealth.registered}/${shortcutHealth.total} active` : 'Checking…'}
+            </div>
+            {shortcutHealth && !shortcutHealth.allRegistered && (
+              <button
+                type="button"
+                onClick={() => {
+                  void window.api.retryShortcuts().then(setShortcutHealth).catch((error: unknown) => {
+                    setPreflightError(error instanceof Error ? error.message : 'Shortcuts could not be retried.')
+                  })
+                }}
+                className="justify-self-start rounded bg-amber-400/15 px-2 py-0.5 text-[10px] text-amber-200 hover:bg-amber-400/25"
+              >
+                Retry shortcuts
+              </button>
+            )}
+          </div>
+          {shortcutHealth && !shortcutHealth.allRegistered && (
+            <details className="mt-2 rounded border border-amber-400/20 bg-amber-400/5 px-2 py-1 text-[10px] text-amber-200">
+              <summary className="cursor-pointer font-medium">Show shortcut conflicts</summary>
+              <ul className="mt-1 space-y-1">
+                {shortcutHealth.shortcuts
+                  .filter((shortcut) => !shortcut.registered)
+                  .map((shortcut) => (
+                    <li key={shortcut.id}>
+                      <span className="font-medium">{shortcut.label}</span> · {shortcut.accelerator}
+                      {shortcut.error ? ` — ${shortcut.error}` : ' — already in use or unavailable'}
+                    </li>
+                  ))}
+              </ul>
+            </details>
+          )}
+          {!aiConfigured && !checkingPreflight && (
+            <p className="mt-2 text-[10px] text-amber-300">
+              Transcription can run, but Answer, analysis and recap need Azure AI settings.
+            </p>
+          )}
+          {preflightError && <p role="alert" className="mt-2 text-[11px] text-red-300">{preflightError}</p>}
+        </section>
       </div>
 
       {/* Footer */}
       <div className="no-drag border-t border-white/10 px-4 py-3">
         <button
-          onClick={() =>
+          type="button"
+          onClick={() => {
+            if (!speechConfigured) {
+              setPreflightError('Add a Sarvam or Deepgram API key before starting transcription.')
+              setShowSettings(true)
+              return
+            }
             onStart({
               mode,
               role,
-              meetingUrl,
               resumeName,
               resumeText,
               jobDescription,
@@ -282,15 +396,23 @@ export default function SetupView({ onStart }: { onStart: (config: SessionConfig
               projectContext,
               techStack
             })
-          }
-          disabled={busy !== null}
+          }}
+          disabled={busy !== null || checkingPreflight || !speechConfigured}
           className="w-full rounded-lg bg-indigo-500 py-2.5 text-sm font-semibold text-white transition hover:bg-indigo-400 disabled:cursor-not-allowed disabled:opacity-50"
         >
           {mode === 'consultant' ? 'Start consultant' : mode === 'meeting' ? 'Start meeting' : 'Start session'}
         </button>
       </div>
 
-      {showSettings && <SettingsPanel onClose={() => setShowSettings(false)} />}
+      {showSettings && (
+        <SettingsPanel
+          onSaved={() => void refreshPreflight()}
+          onClose={() => {
+            setShowSettings(false)
+            void refreshPreflight()
+          }}
+        />
+      )}
     </div>
   )
 }

@@ -5,12 +5,33 @@ import type {
   AiErrorEvent,
   AiTokenEvent
 } from '../shared/ai'
-import type { AudioStopResult, DisplaySourceInfo, PickedDocs } from '../shared/capture'
-export type { AudioStopResult, DisplaySourceInfo, PickedDocs } from '../shared/capture'
+import type {
+  AudioSourceKind,
+  AudioStopResult,
+  DisplaySourceInfo,
+  PickedDocs,
+  ShortcutHealth,
+  SpeechHealth,
+  SpeechStartResult,
+  TranscriptSource,
+  TranscriptStatus
+} from '../shared/capture'
+import type { ReleaseRuntimeInfo, UpdateStatus } from '../shared/release'
+export type {
+  AudioSourceKind,
+  AudioStopResult,
+  DisplaySourceInfo,
+  PickedDocs,
+  ShortcutHealth,
+  SpeechHealth,
+  SpeechStartResult,
+  TranscriptSource,
+  TranscriptStatus
+} from '../shared/capture'
+export type { BuildMetadata, ReleaseRuntimeInfo, UpdateStatus } from '../shared/release'
 
 export type HotkeyPayload = { action: string; value?: unknown }
 export type KeyStatus = { deepgram: boolean; azureOpenAI: boolean }
-export type TranscriptSource = 'interviewer' | 'you'
 export type TranscriptUpdate = {
   source: TranscriptSource
   text: string
@@ -18,7 +39,6 @@ export type TranscriptUpdate = {
   speaker?: number
   confidence?: number
 }
-export type TranscriptStatus = { source: TranscriptSource; status: string; message?: string }
 export type SettingsStatus = {
   sarvamKeySet: boolean
   deepgramKeySet: boolean
@@ -36,11 +56,33 @@ export type SettingsInput = {
   azureDeployment?: string
   azureApiVersion?: string
   allowInsecureTls?: boolean
+  clearSarvamApiKey?: boolean
+  clearDeepgramApiKey?: boolean
+  clearAzureApiKey?: boolean
 }
 
 const api = {
   getVersion: (): Promise<string> => ipcRenderer.invoke('app:getVersion'),
+  getReleaseInfo: (): Promise<ReleaseRuntimeInfo> => ipcRenderer.invoke('release:getInfo'),
+  getUpdateStatus: (): Promise<UpdateStatus | null> => ipcRenderer.invoke('updates:getStatus'),
+  checkForUpdates: (): Promise<boolean> => ipcRenderer.invoke('updates:check'),
+  checkForRollback: (): Promise<boolean> => ipcRenderer.invoke('updates:checkRollback'),
+  downloadUpdate: (): Promise<boolean> => ipcRenderer.invoke('updates:download'),
+  installDownloadedUpdate: (): Promise<boolean> => ipcRenderer.invoke('updates:install'),
+  onUpdateStatus: (callback: (status: UpdateStatus) => void): (() => void) => {
+    const listener = (_event: unknown, status: UpdateStatus): void => callback(status)
+    ipcRenderer.on('updates:status', listener)
+    return () => ipcRenderer.removeListener('updates:status', listener)
+  },
   hasKeys: (): Promise<KeyStatus> => ipcRenderer.invoke('app:hasKeys'),
+  getShortcutHealth: (): Promise<ShortcutHealth> => ipcRenderer.invoke('shortcuts:getHealth'),
+  retryShortcuts: (): Promise<ShortcutHealth> => ipcRenderer.invoke('shortcuts:retry'),
+  onShortcutHealthChanged: (callback: (health: ShortcutHealth) => void): (() => void) => {
+    const listener = (_event: unknown, health: ShortcutHealth): void => callback(health)
+    ipcRenderer.on('shortcuts:status', listener)
+    return () => ipcRenderer.removeListener('shortcuts:status', listener)
+  },
+  getSpeechHealth: (): Promise<SpeechHealth> => ipcRenderer.invoke('speech:getHealth'),
   getSettings: (): Promise<SettingsStatus> => ipcRenderer.invoke('settings:get'),
   saveSettings: (input: SettingsInput): Promise<SettingsStatus> =>
     ipcRenderer.invoke('settings:save', input),
@@ -61,12 +103,21 @@ const api = {
   },
   sendAudioChunk: (kind: 'system' | 'mic', buffer: ArrayBuffer): void =>
     ipcRenderer.send('audio:chunk', kind, buffer),
-  audioStart: (mic: boolean, provider?: 'auto' | 'deepgram' | 'sarvam', keyterms?: string[]): void =>
-    ipcRenderer.send('audio:start', mic, provider ?? 'auto', keyterms ?? []),
+  audioStart: (
+    mic: boolean,
+    provider?: 'auto' | 'deepgram' | 'sarvam',
+    keyterms?: string[]
+  ): Promise<SpeechStartResult> =>
+    ipcRenderer.invoke('audio:start', mic, provider ?? 'auto', keyterms ?? []),
   audioSetMic: (enabled: boolean): void => ipcRenderer.send('audio:setMic', enabled),
   audioStop: (): void => ipcRenderer.send('audio:stop'),
   audioStopGracefully: (timeoutMs = 1800): Promise<AudioStopResult> =>
     ipcRenderer.invoke('audio:stopGracefully', timeoutMs),
+  audioStopSourceGracefully: (
+    kind: AudioSourceKind,
+    timeoutMs = 1800
+  ): Promise<AudioStopResult> =>
+    ipcRenderer.invoke('audio:stopSourceGracefully', kind, timeoutMs),
   onAudioStats: (callback: (stats: { system: number; mic: number }) => void): (() => void) => {
     const listener = (_event: unknown, stats: { system: number; mic: number }): void =>
       callback(stats)

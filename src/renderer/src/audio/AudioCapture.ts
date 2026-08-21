@@ -1,4 +1,5 @@
 import { pcmWorkletSource } from './pcmWorklet'
+import { isLikelyBlankFrame } from './screenDiagnostics'
 
 export type AudioSourceKind = 'system' | 'mic'
 
@@ -69,30 +70,8 @@ export class AudioCapture {
     let screenReady = false
     const videoTrack = stream.getVideoTracks()[0]
     if (captureScreen && videoTrack) {
-      const videoStream = new MediaStream([videoTrack])
-      const video = document.createElement('video')
-      video.muted = true
-      video.playsInline = true
-      video.style.position = 'absolute'
-      video.style.opacity = '0'
-      video.style.pointerEvents = 'none'
-      document.body.appendChild(video)
-      video.srcObject = videoStream
-      this.screenStream = videoStream
-      this.screenVideo = video
-      videoTrack.addEventListener(
-        'ended',
-        () => {
-          if (this.screenVideo === video) {
-            this.handlers.onError('system', new Error('Screen sharing ended'))
-            this.stop('system')
-          }
-        },
-        { once: true }
-      )
       try {
-        await video.play()
-        await this.waitForVideoFrame(video, generation)
+        await this.attachScreenTrack(videoTrack, generation)
         this.ensureActive('system', generation, stream)
         screenReady = true
       } catch (error) {
@@ -126,6 +105,72 @@ export class AudioCapture {
       throw error
     }
     return screenReady
+  }
+
+  /** Mount a display video track on the hidden element used for frame grabs. */
+  private async attachScreenTrack(videoTrack: MediaStreamTrack, generation: number): Promise<void> {
+    const videoStream = new MediaStream([videoTrack])
+    const video = document.createElement('video')
+    video.muted = true
+    video.playsInline = true
+    video.style.position = 'absolute'
+    video.style.opacity = '0'
+    video.style.pointerEvents = 'none'
+    document.body.appendChild(video)
+    video.srcObject = videoStream
+    this.screenStream = videoStream
+    this.screenVideo = video
+    videoTrack.addEventListener(
+      'ended',
+      () => {
+        if (this.screenVideo === video) {
+          this.handlers.onError('system', new Error('Screen sharing ended'))
+        }
+      },
+      { once: true }
+    )
+    await video.play()
+    await this.waitForVideoFrame(video, generation)
+  }
+
+  /**
+   * Turn screen context on WITHOUT restarting audio or speech-to-text.
+   *
+   * The display stream is acquired separately from the loopback-audio stream, so
+   * the running ASR session is untouched. This is what lets Screen be switched on
+   * mid-session instead of forcing a stop/start of the whole capture.
+   */
+  async startScreen(): Promise<boolean> {
+    if (!this.streams.has('system')) {
+      throw new Error('Start listening before turning screen context on.')
+    }
+    // Reuse the CURRENT system generation: if the audio session is replaced while
+    // we are acquiring, this attach aborts instead of leaking a stale video track.
+    const generation = this.generations.system
+    this.stopScreenCapture()
+    const stream = await navigator.mediaDevices.getDisplayMedia({ audio: false, video: true })
+    const videoTrack = stream.getVideoTracks()[0]
+    if (!videoTrack) {
+      stream.getTracks().forEach((track) => track.stop())
+      throw new Error('The selected display did not provide a video track.')
+    }
+    // A display stream can carry audio even when we did not ask for it; drop it so
+    // nothing competes with the loopback capture already feeding the ASR.
+    stream.getAudioTracks().forEach((track) => track.stop())
+    try {
+      this.ensureActive('system', generation, stream)
+      await this.attachScreenTrack(videoTrack, generation)
+      this.ensureActive('system', generation, stream)
+      return true
+    } catch (error) {
+      this.stopScreenCapture()
+      throw error
+    }
+  }
+
+  /** Drop screen context, leaving audio capture and speech-to-text running. */
+  stopScreen(): void {
+    this.stopScreenCapture()
   }
 
   private ensureActive(
@@ -194,7 +239,13 @@ export class AudioCapture {
     maxWidth = 1440,
     maxHeight = 900,
     quality = 0.72
-  ): { dataUrl: `data:image/jpeg;base64,${string}`; width: number; height: number; capturedAt: number } | null {
+  ): {
+    dataUrl: `data:image/jpeg;base64,${string}`
+    width: number
+    height: number
+    capturedAt: number
+    likelyBlank: boolean
+  } | null {
     const video = this.screenVideo
     const track = this.screenStream?.getVideoTracks()[0]
     if (!track || track.readyState !== 'live') return null
@@ -210,13 +261,24 @@ export class AudioCapture {
     const ctx = canvas.getContext('2d')
     if (!ctx) return null
     ctx.drawImage(video, 0, 0, width, height)
+    const diagnostic = document.createElement('canvas')
+    diagnostic.width = 16
+    diagnostic.height = 10
+    const diagnosticContext = diagnostic.getContext('2d', { willReadFrequently: true })
+    diagnosticContext?.drawImage(canvas, 0, 0, diagnostic.width, diagnostic.height)
+    const likelyBlank = diagnosticContext
+      ? isLikelyBlankFrame(
+          diagnosticContext.getImageData(0, 0, diagnostic.width, diagnostic.height).data
+        )
+      : false
     const dataUrl = canvas.toDataURL('image/jpeg', quality)
     if (!dataUrl.startsWith('data:image/jpeg;base64,')) return null
     return {
       dataUrl: dataUrl as `data:image/jpeg;base64,${string}`,
       width,
       height,
-      capturedAt: Date.now()
+      capturedAt: Date.now(),
+      likelyBlank
     }
   }
 
@@ -304,7 +366,6 @@ export class AudioCapture {
           kind,
           new Error(kind === 'system' ? 'System audio ended' : 'Microphone ended')
         )
-        this.stop(kind)
       })
       this.contexts.set(kind, ctx)
       this.streams.set(kind, stream)

@@ -1,4 +1,5 @@
 import WebSocket from 'ws'
+import { BoundedPcmBuffer } from './asrSession'
 
 export type TranscriptHandler = (
   text: string,
@@ -88,7 +89,13 @@ export interface DeepgramOptions {
  */
 export class DeepgramStream {
   private ws: WebSocket | null = null
+  private connectStarted = false
+  private closed = false
+  private flushRequested = false
+  private flushSent = false
   private keepAlive: ReturnType<typeof setInterval> | null = null
+  private drainTimer: ReturnType<typeof setTimeout> | null = null
+  private readonly pendingAudio = new BoundedPcmBuffer()
   private readonly url: string
 
   constructor(private readonly opts: DeepgramOptions) {
@@ -134,6 +141,11 @@ export class DeepgramStream {
   }
 
   connect(): void {
+    // A delayed reconnect can race with graceful Stop, which asks the stream to
+    // connect immediately so its queued audio can be finalized. Keep connect
+    // idempotent so those two paths never open duplicate sockets.
+    if (this.closed || this.connectStarted) return
+    this.connectStarted = true
     const ws = new WebSocket(this.url, {
       headers: { Authorization: `Token ${this.opts.apiKey}` },
       rejectUnauthorized: !this.opts.allowInsecureTls
@@ -141,6 +153,11 @@ export class DeepgramStream {
     this.ws = ws
 
     ws.on('open', () => {
+      if (this.closed || this.ws !== ws) {
+        ws.close()
+        return
+      }
+      this.drainPendingAudio(this.flushRequested)
       this.opts.onOpen?.()
       // Deepgram closes idle sockets after ~10s; KeepAlive guards silent gaps.
       this.keepAlive = setInterval(() => {
@@ -186,31 +203,111 @@ export class DeepgramStream {
     ws.on('close', () => {
       if (this.keepAlive) clearInterval(this.keepAlive)
       this.keepAlive = null
+      if (this.drainTimer) clearTimeout(this.drainTimer)
+      this.drainTimer = null
       this.opts.onClose?.()
     })
   }
 
   send(pcm: ArrayBuffer | Buffer | Uint8Array): void {
-    if (this.ws && this.ws.readyState === WebSocket.OPEN) {
-      this.ws.send(pcm)
+    const ws = this.ws
+    if (
+      ws &&
+      ws.readyState === WebSocket.OPEN &&
+      ws.bufferedAmount < 256 * 1024 &&
+      this.pendingAudio.byteLength === 0
+    ) {
+      try {
+        ws.send(pcm)
+        return
+      } catch {
+        // Preserve this chunk for the reconnect/error callback to recover.
+      }
     }
+    this.pendingAudio.push(pcm)
+    this.scheduleDrain()
+  }
+
+  private scheduleDrain(): void {
+    if (this.drainTimer || !this.ws || this.ws.readyState !== WebSocket.OPEN) return
+    this.drainTimer = setTimeout(() => {
+      this.drainTimer = null
+      this.drainPendingAudio()
+    }, 40)
+  }
+
+  private drainPendingAudio(force = false): void {
+    const ws = this.ws
+    if (!ws || ws.readyState !== WebSocket.OPEN) return
+    while (this.pendingAudio.byteLength > 0 && (force || ws.bufferedAmount < 256 * 1024)) {
+      const chunk = this.pendingAudio.shift()
+      if (!chunk) break
+      try {
+        ws.send(chunk)
+      } catch {
+        this.pendingAudio.prepend(chunk)
+        break
+      }
+    }
+    if (this.pendingAudio.byteLength > 0) this.scheduleDrain()
+    else this.sendFinalizeIfReady(ws)
+  }
+
+  private sendFinalizeIfReady(ws: WebSocket): void {
+    if (
+      !this.flushRequested ||
+      this.flushSent ||
+      this.pendingAudio.byteLength > 0 ||
+      ws.readyState !== WebSocket.OPEN
+    ) {
+      return
+    }
+    try {
+      ws.send(JSON.stringify({ type: 'Finalize' }))
+      this.flushSent = true
+    } catch {
+      // Retry briefly while the graceful-stop deadline is still running.
+      this.scheduleDrain()
+    }
+  }
+
+  /** Move unsent audio into a replacement stream during reconnect/fallback. */
+  takePendingAudio(): Buffer[] {
+    return this.pendingAudio.drain()
+  }
+
+  takeDroppedAudioBytes(): number {
+    return this.pendingAudio.takeDroppedBytes()
   }
 
   /** Ask Deepgram to finalize the audio received so far without closing yet. */
   flush(): void {
+    this.flushRequested = true
     const ws = this.ws
-    if (!ws || ws.readyState !== WebSocket.OPEN) return
-    try {
-      ws.send(JSON.stringify({ type: 'Finalize' }))
-    } catch {
-      // The socket's error/close callback owns reporting.
+    if (!ws) {
+      // During reconnect backoff the replacement stream owns queued PCM but has
+      // no socket yet. Bypass the delay so graceful Stop has a bounded chance to
+      // upload and finalize that tail before its timeout expires.
+      try {
+        this.connect()
+      } catch (error) {
+        this.opts.onError?.(error instanceof Error ? error : new Error(String(error)))
+      }
+      return
     }
+    if (ws.readyState !== WebSocket.OPEN) return
+    this.drainPendingAudio(true)
   }
 
   close(): void {
+    this.closed = true
     if (this.keepAlive) {
       clearInterval(this.keepAlive)
       this.keepAlive = null
+    }
+    if (this.drainTimer) {
+      clearTimeout(this.drainTimer)
+      this.drainTimer = null
     }
     const ws = this.ws
     this.ws = null

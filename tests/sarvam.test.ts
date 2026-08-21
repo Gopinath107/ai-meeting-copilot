@@ -11,4 +11,15 @@ describe('SarvamStream graceful finalization', () => {
 
     expect(url.searchParams.get('flush_signal')).toBe('true')
   })
+
+  it('buffers audio sent before the socket is ready', () => {
+    const stream = new SarvamStream({
+      apiKey: 'test-only',
+      onTranscript: vi.fn()
+    })
+
+    stream.send(Buffer.from([1, 2, 3, 4]))
+
+    expect(Buffer.concat(stream.takePendingAudio())).toEqual(Buffer.from([1, 2, 3, 4]))
+  })
 })

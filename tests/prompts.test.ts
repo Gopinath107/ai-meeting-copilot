@@ -2,6 +2,7 @@ import { describe, expect, it } from 'vitest'
 import type { SessionConfig } from '../src/renderer/src/App'
 import {
   buildMeetingSystemPrompt,
+  buildMinutesPrompt,
   buildSpeechKeyterms
 } from '../src/renderer/src/views/overlay/prompts'
 
@@ -9,7 +10,6 @@ function meetingConfig(overrides: Partial<SessionConfig> = {}): SessionConfig {
   return {
     mode: 'meeting',
     role: '',
-    meetingUrl: '',
     resumeText: '',
     jobDescription: '',
     docNames: [],
@@ -46,5 +46,18 @@ describe('meeting prompt scoping', () => {
         consultant: false
       })
     ).toEqual(expect.arrayContaining(['Ruby', 'Rails']))
+  })
+})
+
+describe('session recap scoping', () => {
+  it('uses interview-specific recap sections instead of meeting minutes', () => {
+    const prompt = buildMinutesPrompt({
+      ...meetingConfig(),
+      mode: 'interview'
+    })
+
+    expect(prompt).toContain('# Interview Recap')
+    expect(prompt).toContain('## Questions Asked')
+    expect(prompt).not.toContain('# Minutes of Meeting')
   })
 })

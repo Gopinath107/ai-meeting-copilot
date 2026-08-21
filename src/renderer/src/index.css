@@ -14,15 +14,32 @@ body {
   font-family: 'Segoe UI', system-ui, -apple-system, sans-serif;
   color: #e5e7eb;
   overflow: hidden;
-  user-select: none;
 }
 
 /* Frameless-window drag regions */
 .drag {
   -webkit-app-region: drag;
+  user-select: none;
 }
 .no-drag {
   -webkit-app-region: no-drag;
+}
+
+.selectable,
+input,
+textarea {
+  user-select: text;
+}
+
+button,
+select,
+label {
+  user-select: none;
+}
+
+:focus-visible {
+  outline: 2px solid rgb(129 140 248 / 0.9);
+  outline-offset: 2px;
 }
 
 /* Slim scrollbars for the panes */
@@ -32,4 +49,11 @@ body {
 ::-webkit-scrollbar-thumb {
   background: rgba(255, 255, 255, 0.15);
   border-radius: 3px;
+}
+
+/* Transcript rows remain in the DOM for search, selection and accessibility,
+   but Chromium can skip layout/paint work for rows outside the scrollport. */
+.transcript-line {
+  content-visibility: auto;
+  contain-intrinsic-size: auto 32px;
 }
